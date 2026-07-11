@@ -223,6 +223,14 @@ if "fitbit" not in st.session_state:
             "After you log in and approve, we'll continue to enrollment.</div>",
             unsafe_allow_html=True,
         )
+        st.info(
+            "**Connecting a different Fitbit account than the one already "
+            "logged into this browser?** Fitbit will silently reconnect the "
+            "same account instead of prompting you to log in again, unless "
+            "you first log out at fitbit.com, or open this page in a "
+            "private/incognito window.",
+            icon="⚠️",
+        )
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
         # verifier travels in `state` so the callback can recover it even if
@@ -234,6 +242,13 @@ if "fitbit" not in st.session_state:
             f"&scope={urllib.parse.quote(SCOPES)}"
             f"&code_challenge={challenge}&code_challenge_method=S256"
             f"&state={urllib.parse.quote(verifier)}"
+            # Best-effort: some OAuth2 servers honor `prompt=login` to force
+            # a fresh login instead of silently reusing the browser's
+            # existing session. NOT documented in Fitbit's public OAuth2
+            # docs as of this writing — unverified whether Fitbit respects
+            # it. Harmless if ignored; the st.info() above is the
+            # guaranteed-to-work fallback (logout/incognito).
+            "&prompt=login"
         )
         st.markdown(
             f"""<div style="text-align:center; margin-top:25px;">
