@@ -125,8 +125,18 @@ S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit-tokens/")
 # Clarity does NOT use this: its raw data is per-minute CSVs (columns like
 # datasourceid/sourceid), not a per-device folder — so there is no
 # automatic Clarity/site dropdown. The research admin types the Clarity
-# device id directly (see Step 3), same as org_id.
+# device id directly (see Step 3), same as org_id, but it's validated
+# against KNOWN_CLARITY_IDS below rather than accepted unchecked.
 RAW_BUCKET = conf("RAW_BUCKET", "raw-data-all-sensors-782329476642-us-east-1-an")
+
+# Comma-separated whitelist of valid Clarity device ids for this study
+# (currently just one station: DGFVZ0274). A typed site_id that doesn't
+# match gets rejected with a clear "contact the research admin" message
+# instead of silently misattributing environmental data. Empty/unset =
+# validation is skipped entirely (useful if a future org hasn't fixed
+# its station roster yet).
+KNOWN_CLARITY_IDS = [c.strip() for c in (conf("CLARITY_ID", "") or "").split(",")
+                     if c.strip()]
 
 OTHER_OPTION = "Other (new device — type its ID)"
 
@@ -365,15 +375,20 @@ with st.form("enroll"):
     race = st.text_input("Race/ethnicity")
 
     # site_id IS the Clarity environmental station's device id — typed
-    # directly, not derived from S3. Clarity's raw data is per-minute CSVs
-    # (datasourceid/sourceid columns), not a per-device folder like
-    # Fitbit/Cosinuss, so there's no reliable way to list known stations
-    # from the bucket the way the wearable pools do.
+    # directly, not derived from S3 (Clarity's raw data is per-minute CSVs,
+    # not a per-device folder like Fitbit/Cosinuss). Checked against
+    # KNOWN_CLARITY_IDS on submit below rather than accepted unchecked.
     site_id = st.text_input(
         "Clarity device ID (work site's environmental sensor)",
-        help="The Clarity unit currently covering this participant's work "
-             "site — this is its datasourceid. Ask the site organizer if "
-             "unsure — do not guess.",
+        help=(
+            f"Must match a registered station for this study "
+            f"({', '.join(KNOWN_CLARITY_IDS)}). Contact the research admin "
+            f"if you don't have the correct ID — do not guess."
+            if KNOWN_CLARITY_IDS else
+            "The Clarity unit currently covering this participant's work "
+            "site — this is its datasourceid. Ask the site organizer if "
+            "unsure — do not guess."
+        ),
     )
 
     cosinuss_pick = cosinuss_other = None
@@ -401,6 +416,13 @@ def _resolve_pick(pick, other):
 
 if submitted:
     site_id = (site_id or "").strip()
+    if KNOWN_CLARITY_IDS and site_id not in KNOWN_CLARITY_IDS:
+        st.error(
+            f"'{site_id}' isn't a recognized Clarity device for this study. "
+            "No registration was created. Please double-check the ID with "
+            "the research admin or support team, then try again."
+        )
+        st.stop()
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
     req = RegistrationRequest(
         user_id=(user_id or "").strip(), email=(email or "").strip(),
