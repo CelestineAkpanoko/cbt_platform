@@ -59,7 +59,6 @@ from registration_service import (
     DuplicateSubmissionError,
     RegistrationRequest,
     ValidationError,
-    list_clarity_ids,
     list_wearable_ids,
     register,
     unassigned_devices,
@@ -112,12 +111,21 @@ SCOPES = (
     "electrocardiogram irregular_rhythm_notifications"
 )
 
-ORG_ID = conf("CBT_ORG_ID", "org1")
+# Default/fallback org_id — the actual value used for any given
+# registration is typed into the form (Step 3), since org_id is per-tenant
+# scoping and this portal may serve more than one org over time. This is
+# just what pre-fills the field and what the OAuth step (which happens
+# before org_id is known) stamps into the token file provisionally.
+DEFAULT_ORG_ID = conf("CBT_ORG_ID", "org1")
 AWS_REGION = conf("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
 S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit-tokens/")
-# The raw sensor bucket doubles as the device inventory (see module
-# docstring) — the Cosinuss/Clarity dropdowns are derived from its prefixes.
+# The raw sensor bucket doubles as the device inventory for Fitbit/Cosinuss
+# (see module docstring) — folder-per-device-id, so prefix listing works.
+# Clarity does NOT use this: its raw data is per-minute CSVs (columns like
+# datasourceid/sourceid), not a per-device folder — so there is no
+# automatic Clarity/site dropdown. The research admin types the Clarity
+# device id directly (see Step 3), same as org_id.
 RAW_BUCKET = conf("RAW_BUCKET", "raw-data-all-sensors-782329476642-us-east-1-an")
 
 OTHER_OPTION = "Other (new device — type its ID)"
@@ -138,19 +146,14 @@ _dynamodb = _session.resource("dynamodb")
 _client = _session.client("dynamodb")
 _s3 = _session.client("s3")
 
-participants = ScopedTable(_dynamodb.Table("Participants"), ORG_ID)
-devices = ScopedTable(_dynamodb.Table("DeviceAssignments"), ORG_ID)
-sites = ScopedTable(_dynamodb.Table("SiteAssignments"), ORG_ID)
+# NB: no ScopedTable objects here — they depend on org_id, which is a form
+# field entered in Step 3, not a fixed app-wide constant. Built dynamically
+# below once the org_id field's current value is known.
 
 
 @st.cache_data(ttl=300)
 def known_cosinuss_ids() -> list[str]:
     return list_wearable_ids(_s3, RAW_BUCKET, "cosinuss")
-
-
-@st.cache_data(ttl=300)
-def known_clarity_ids() -> list[str]:
-    return list_clarity_ids(_s3, RAW_BUCKET)
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +282,12 @@ if "fitbit" not in st.session_state:
             datetime.datetime.now(datetime.timezone.utc).timestamp()
             + tokens["expires_in"]
         )
-    # enrollment linkage, filled in after the form is submitted (below)
+    # enrollment linkage, filled in after the form is submitted (below).
+    # org_id is provisional here — the real value is whatever's typed into
+    # the org_id field in Step 3, which overwrites this on successful
+    # enrollment (see the stamped write further down).
     token_payload["participant_id"] = None
-    token_payload["org_id"] = ORG_ID
+    token_payload["org_id"] = DEFAULT_ORG_ID
 
     try:
         _s3.put_object(
@@ -317,6 +323,21 @@ st.markdown(
 st.markdown("<div class='subheader'>Step 2 — Participant enrollment</div>",
             unsafe_allow_html=True)
 
+# org_id and mode both live OUTSIDE st.form: org_id determines which
+# tenant's tables everything below queries, and widgets inside st.form
+# don't trigger a rerun until submit — so both need to be normal widgets
+# to keep the Cosinuss pool (and, on submit, the registration itself)
+# scoped to the org actually typed in.
+org_id_input = st.text_input(
+    "Organization ID", value=DEFAULT_ORG_ID,
+    help="Tenant scope for this registration. Leave the default unless "
+         "you know this study spans multiple orgs.",
+).strip() or DEFAULT_ORG_ID
+
+participants = ScopedTable(_dynamodb.Table("Participants"), org_id_input)
+devices = ScopedTable(_dynamodb.Table("DeviceAssignments"), org_id_input)
+sites = ScopedTable(_dynamodb.Table("SiteAssignments"), org_id_input)
+
 mode = st.radio("Enrollment mode", ["production", "research"], horizontal=True)
 
 # fitbit_id comes straight from the OAuth step — it's the same id the pull
@@ -324,11 +345,11 @@ mode = st.radio("Enrollment mode", ["production", "research"], horizontal=True)
 # no chance of attributing the participant to the wrong Fitbit.
 fitbit_id = encoded_id
 
-# Dropdown pools derived from the raw bucket (5-min cache). NB: widgets
-# inside st.form don't re-render until submit, so the "Other" text inputs
-# below are always visible instead of appearing conditionally.
+# Cosinuss pool derived from the raw bucket (5-min cache, folder-per-device
+# layout). NB: widgets inside st.form don't re-render until submit, so the
+# "Other" text input below is always visible instead of appearing
+# conditionally.
 cosinuss_pool = unassigned_devices(devices, "cosinuss", known_cosinuss_ids())
-clarity_pool = known_clarity_ids()
 
 with st.form("enroll"):
     st.text_input("Fitbit ID (from the connected account)", value=fitbit_id,
@@ -343,17 +364,16 @@ with st.form("enroll"):
     weight_lbs = st.number_input("Weight (lbs)", 60.0, 500.0, 160.0)
     race = st.text_input("Race/ethnicity")
 
-    # site_id IS the Clarity environmental station's device id. Dropdown of
-    # stations seen recently in the raw bucket, with a typed override for a
-    # unit that hasn't uploaded yet.
-    site_pick = st.selectbox(
-        "Clarity device (work site's environmental sensor)",
-        clarity_pool + [OTHER_OPTION],
+    # site_id IS the Clarity environmental station's device id — typed
+    # directly, not derived from S3. Clarity's raw data is per-minute CSVs
+    # (datasourceid/sourceid columns), not a per-device folder like
+    # Fitbit/Cosinuss, so there's no reliable way to list known stations
+    # from the bucket the way the wearable pools do.
+    site_id = st.text_input(
+        "Clarity device ID (work site's environmental sensor)",
         help="The Clarity unit currently covering this participant's work "
-             "site. Ask the site organizer if unsure — do not guess.",
-    )
-    site_other = st.text_input(
-        "If the Clarity device isn't listed, type its ID here",
+             "site — this is its datasourceid. Ask the site organizer if "
+             "unsure — do not guess.",
     )
 
     cosinuss_pick = cosinuss_other = None
@@ -380,7 +400,7 @@ def _resolve_pick(pick, other):
     return ""
 
 if submitted:
-    site_id = _resolve_pick(site_pick, site_other)
+    site_id = (site_id or "").strip()
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
     req = RegistrationRequest(
         user_id=(user_id or "").strip(), email=(email or "").strip(),
@@ -398,14 +418,17 @@ if submitted:
     except DuplicateSubmissionError:
         st.warning("This registration was already submitted — no duplicate created.")
     else:
-        # Stamp the participant_id into the token file so
+        # Stamp the participant_id + real org_id into the token file so
         # tokens/{fitbit_id}.json is traceable to the enrolled person —
         # rewriting the SAME payload saved at OAuth time (all token fields
-        # preserved), with only participant_id updated.
+        # preserved). org_id was only a provisional default at OAuth time
+        # (org_id wasn't known yet); this replaces it with what was
+        # actually typed into the form.
         # Best-effort: never fail an otherwise-successful enrollment on it.
         try:
             stamped = {**fitbit["token_payload"],
-                       "participant_id": result.participant_id}
+                       "participant_id": result.participant_id,
+                       "org_id": org_id_input}
             _s3.put_object(
                 Bucket=S3_BUCKET_NAME, Key=f"{S3_TOKEN_PREFIX}{encoded_id}.json",
                 Body=json.dumps(stamped), ContentType="application/json",

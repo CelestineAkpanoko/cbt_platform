@@ -8,7 +8,7 @@ from .service import (
     unassigned_devices,
 )
 from .migration import migrate_legacy_users
-from .s3_inventory import list_clarity_ids, list_wearable_ids
+from .s3_inventory import list_wearable_ids
 
 __all__ = [
     "RegistrationRequest",
@@ -20,5 +20,4 @@ __all__ = [
     "unassigned_devices",
     "migrate_legacy_users",
     "list_wearable_ids",
-    "list_clarity_ids",
 ]

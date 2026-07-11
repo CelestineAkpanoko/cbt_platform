@@ -1,19 +1,20 @@
-"""Device inventory derived from the raw sensor bucket — no table, no CLI.
+"""Wearable device inventory derived from the raw sensor bucket — no
+table, no CLI.
 
-The pull Lambdas already land data keyed by device id:
+The pull Lambdas land Fitbit/Cosinuss data keyed by device id:
     <bucket>/fitbit/raw/<fitbit_id>/<date>/...
     <bucket>/cosinuss/raw/<device_id>/<date>/...
-    <bucket>/clarity/raw/<date>/<clarity_id>_*.json
 
-So the bucket itself is the authoritative list of devices the platform has
-ever seen — anything that has uploaded at least once appears as a prefix.
-The enrollment form derives its dropdowns from here instead of a manually
-maintained list, with a free-text "Other (new device)" fallback for
-hardware so new it hasn't uploaded yet.
+So the bucket itself is the authoritative list of wearables the platform
+has ever seen — anything that has uploaded at least once appears as a
+prefix. The enrollment form derives its Cosinuss dropdown from here
+instead of a manually maintained list, with a free-text "Other (new
+device)" fallback for hardware so new it hasn't uploaded yet.
 
-Note the asymmetry: fitbit/cosinuss ids are path segments (one cheap
-delimiter listing); clarity ids live inside filenames under date folders,
-so we scan the most recent date prefixes only.
+Clarity is NOT covered here — its raw data is per-minute CSVs with
+columns like datasourceid/sourceid, not a per-device folder, so there is
+no reliable way to list known stations from bucket structure alone. The
+Clarity/site id is entered directly in the enrollment form instead.
 """
 
 from __future__ import annotations
@@ -35,27 +36,4 @@ def list_wearable_ids(s3_client, bucket: str, device_type: str) -> list[str]:
             device_id = cp["Prefix"].rstrip("/").rsplit("/", 1)[-1]
             if device_id:
                 ids.add(device_id)
-    return sorted(ids)
-
-
-def list_clarity_ids(s3_client, bucket: str, recent_dates: int = 30) -> list[str]:
-    """Clarity station ids seen in the most recent `recent_dates` date
-    folders (ids are filename prefixes: <clarity_id>_*.json)."""
-    paginator = s3_client.get_paginator("list_objects_v2")
-
-    date_prefixes: list[str] = []
-    for page in paginator.paginate(Bucket=bucket, Prefix="clarity/raw/",
-                                   Delimiter="/"):
-        date_prefixes.extend(cp["Prefix"] for cp in page.get("CommonPrefixes", []))
-    # date folder names sort chronologically (YYYY-MM-DD)
-    date_prefixes = sorted(date_prefixes)[-recent_dates:]
-
-    ids: set[str] = set()
-    for prefix in date_prefixes:
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                filename = obj["Key"].rsplit("/", 1)[-1]
-                clarity_id = filename.split("_")[0]
-                if clarity_id:
-                    ids.add(clarity_id)
     return sorted(ids)
