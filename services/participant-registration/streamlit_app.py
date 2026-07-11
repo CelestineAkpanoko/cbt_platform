@@ -85,9 +85,26 @@ DEBUG_MODE = str(conf("DEBUG_MODE", "false")).strip().lower() in ("1", "true", "
 
 CLIENT_ID = conf("FITBIT_CLIENT_ID")
 # MUST equal this app's own public URL and match the Fitbit dev-console
-# "Redirect URL" exactly (the standalone portal pointed at its own URL;
-# the merged app has to point at wherever THIS app is served).
-REDIRECT_URI = conf("REDIRECT_URI", "https://fitbit-verification-page-hsr.streamlit.app")
+# "Redirect URL" exactly. No default — a stale/wrong default here is
+# exactly the class of bug that silently sends users to the wrong app; if
+# it isn't set, fail loudly below rather than guess.
+REDIRECT_URI = conf("REDIRECT_URI")
+
+_missing = [k for k, v in {
+    "FITBIT_CLIENT_ID": CLIENT_ID,
+    "REDIRECT_URI": REDIRECT_URI,
+}.items() if not v]
+if _missing:
+    st.error(
+        "This app is missing required configuration: "
+        f"**{', '.join(_missing)}**.\n\n"
+        "Add them under Settings → Secrets in Streamlit Cloud (see "
+        "`.streamlit/secrets.toml.example` for the exact keys), then "
+        "reboot the app. Nothing else on this page will work until "
+        "these are set — Fitbit will reject an authorization request "
+        "with a missing/placeholder client_id."
+    )
+    st.stop()
 
 SCOPES = (
     "activity heartrate location nutrition profile settings sleep social weight "

@@ -15,6 +15,6 @@ Enrollment (Section 3) + legacy migration (Section 3b).
   `cosinuss/raw/<id>/`, `clarity/raw/<date>/<id>_*.json`) — the bucket IS
   the inventory, nothing to maintain. fitbit_id needs no pool: it's
   auto-captured from the OAuth step (same id the raw data lands under).
-- `app.py` — Streamlit UI: Fitbit OAuth connection + registration form in
+- `streamlit_app.py` — Streamlit UI: Fitbit OAuth connection + registration form in
   one flow (thin; all business logic is in the tested service).
 - `api_handler.py` — Lambda for scripted/bulk enrollment (`POST /register`).
