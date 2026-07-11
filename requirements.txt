@@ -1,0 +1,6 @@
+# Runtime deps for the Streamlit enrollment portal
+# (services/participant-registration/app.py). Streamlit Cloud installs from
+# this file at the repo root. Dev/test deps live in requirements-dev.txt.
+streamlit>=1.35
+boto3>=1.34
+requests>=2.31

@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+dist/
+infra/shared/layer/
+.aws-sam/
+
+# Real secrets — never commit. Only *.example files are tracked.
+# NB: **/ prefix required — a bare ".streamlit/secrets.toml" only anchors
+# to the repo root and misses nested app dirs like
+# services/participant-registration/.streamlit/secrets.toml.
+**/.streamlit/secrets.toml
+**/secrets.toml
+legacy-users.json
+email-roster.json
+*.pem
+*.env
+reg-api.txt
+
+# Local tool config, not project source
+.claude/
