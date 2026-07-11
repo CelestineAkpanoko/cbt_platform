@@ -324,12 +324,24 @@ fitbit = st.session_state["fitbit"]
 encoded_id = fitbit["encoded_id"]
 
 st.markdown(
-    """<div style="text-align:center;"><div style="background-color:#e8f8ee;
+    f"""<div style="text-align:center;"><div style="background-color:#e8f8ee;
        padding:14px 20px; border-radius:12px; display:inline-block; font-size:20px;
        color:#1b7a4e; font-weight:500; margin-bottom:10px;">
-       ✔️ Fitbit account connected</div></div>""",
+       ✔️ Fitbit account connected (ID: {encoded_id})</div></div>""",
     unsafe_allow_html=True,
 )
+_reconnect_col = st.columns([3, 1])[1]
+with _reconnect_col:
+    if st.button("🔄 Connect a different Fitbit device", use_container_width=True):
+        # Reset to Step 1. Also clear ?code=/?state= from the URL — Fitbit
+        # authorization codes are single-use, so leaving the old ones in
+        # place would make the rerun immediately try (and fail) to
+        # re-exchange an already-consumed code instead of showing the
+        # landing page. The previously saved token file in S3 is untouched.
+        st.session_state.pop("fitbit", None)
+        st.query_params.clear()
+        st.rerun()
+
 st.markdown("<div class='subheader'>Step 2 — Participant enrollment</div>",
             unsafe_allow_html=True)
 
