@@ -60,6 +60,10 @@ class RegistrationRequest:
     fitbit_id: str
     effective_from: str  # ISO 8601
     cosinuss_id: Optional[str] = None  # research mode only
+    # Required for new enrollments (the NIOSH HR check needs it); Optional
+    # in the dataclass only so pre-existing callers/tests fail validation,
+    # not construction.
+    age: Optional[int] = None
 
 
 @dataclass
@@ -79,6 +83,8 @@ def _validate(req: RegistrationRequest):
         raise ValidationError(f"enrollment_mode must be one of {ENROLLMENT_MODES}")
     if not req.consent_given:
         raise ValidationError("consent is required to enroll")
+    if req.age is None or not (18 <= int(req.age) <= 100):
+        raise ValidationError("age is required (18-100)")
     if not req.site_id:
         raise ValidationError("a site pick is required")
     if not req.fitbit_id:
@@ -153,6 +159,7 @@ def _create_participant(participants: ScopedTable, req: RegistrationRequest,
         consent_status="consented",
         enrolled_at=req.effective_from,
         identity_source="native",
+        age=int(req.age),
     )
     item = p.to_item()
     item["user_id_pk"] = participants.scoped(req.user_id)
@@ -210,6 +217,7 @@ def _relink_existing(participants: ScopedTable, existing: dict,
         "race": req.race,
         "enrollment_mode": req.enrollment_mode,
         "consent_status": "consented",
+        "age": int(req.age),
     }
     if existing.get("identity_source") == "legacy_migrated":
         updates["identity_source"] = "legacy_migrated_email_attached"

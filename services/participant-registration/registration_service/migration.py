@@ -87,6 +87,7 @@ def migrate_legacy_users(participants: ScopedTable, users_json: dict,
             consent_status="consented",
             enrolled_at="1970-01-01T00:00:00Z",
             identity_source="legacy_migrated",
+            age=demographics.get("age"),
             current_baseline=current_baseline,
         )
         item = p.to_item()

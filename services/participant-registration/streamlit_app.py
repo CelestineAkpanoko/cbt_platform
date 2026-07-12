@@ -119,7 +119,12 @@ SCOPES = (
 DEFAULT_ORG_ID = conf("CBT_ORG_ID", "org1")
 AWS_REGION = conf("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
-S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit-tokens/")
+# MUST match the pull Lambda's TOKEN_PREFIX (fitbit_tokens/, underscore).
+# A re-registration rotates the Fitbit grant — the old refresh token dies —
+# so if this prefix diverges from the puller's, every re-registration
+# silently kills that participant's ingestion (root-caused 2026-07-12 with
+# user14: token written to fitbit-tokens/, puller reading fitbit_tokens/).
+S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit_tokens/")
 # The raw sensor bucket doubles as the device inventory for Fitbit/Cosinuss
 # (see module docstring) — folder-per-device-id, so prefix listing works.
 # Clarity does NOT use this: its raw data is per-minute CSVs (columns like
@@ -397,6 +402,9 @@ with st.form("enroll"):
     email = st.text_input("Email")
     display_name = st.text_input("Display name / anonymized ID")
     sex = st.selectbox("Sex", ["female", "male", "intersex", "prefer not to say"])
+    age = st.number_input(
+        "Age (years)", 18, 100, 30,
+        help="Used for the NIOSH heart-rate safety limit (180 − age).")
     height_in = st.number_input("Height (in)", 36.0, 90.0, 66.0)
     weight_lbs = st.number_input("Weight (lbs)", 60.0, 500.0, 160.0)
     race = st.text_input("Race/ethnicity")
@@ -453,7 +461,8 @@ if submitted:
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
     req = RegistrationRequest(
         user_id=(user_id or "").strip(), email=(email or "").strip(),
-        display_name=(display_name or "").strip(), sex=sex, height_in=height_in,
+        display_name=(display_name or "").strip(), sex=sex, age=int(age),
+        height_in=height_in,
         weight_lbs=weight_lbs, race=race, enrollment_mode=mode,
         consent_given=consent, site_id=site_id, fitbit_id=fitbit_id,
         cosinuss_id=cosinuss_id,

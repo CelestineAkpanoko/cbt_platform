@@ -46,6 +46,11 @@ class Participant:
     consent_status: str
     enrolled_at: str  # ISO 8601
     identity_source: str  # "legacy_migrated" | "native"
+    # Needed by the feedback layer's NIOSH heart-rate check
+    # (fitbit_hr > 180 - age). Optional because pre-2026-07 records were
+    # created before the field existed; ops/backfill_participant_age.py
+    # backfills those from the legacy users.json demographics.
+    age: Optional[int] = None
     # Fast-read cache of the most recent completed calibration. Source of
     # truth is the CalibrationHistory log, not this field.
     current_baseline: Optional[dict] = None
