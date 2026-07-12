@@ -21,3 +21,6 @@ reg-api.txt
 
 # Local tool config, not project source
 .claude/
+
+# Internal deploy notes — kept local, not published
+DEPLOY.md
