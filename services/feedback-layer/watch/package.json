@@ -1,0 +1,39 @@
+{
+  "name": "cbt-heat-stress-watch",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@fitbit/sdk": "^6.1.0",
+    "@fitbit/sdk-cli": "^1.7.3"
+  },
+  "scripts": {
+    "build": "fitbit-build",
+    "debug": "fitbit"
+  },
+  "fitbit": {
+    "appUUID": "5b0e5a7e-2f5d-4d5e-9b7a-1f6a3c9e8d21",
+    "appType": "app",
+    "appDisplayName": "CBT Heat Alert",
+    "iconFile": "resources/icon.png",
+    "wipeColor": "#12314f",
+    "requestedPermissions": [
+      "access_internet",
+      "run_background"
+    ],
+    "buildTargets": [
+      "atlas",
+      "vulcan"
+    ],
+    "i18n": {
+      "en": {
+        "name": "CBT Heat Alert"
+      }
+    }
+  },
+  "allowScripts": {
+    "keytar@6.0.1": true,
+    "fsevents@2.3.3": true,
+    "core-js@2.6.12": true
+  }
+}

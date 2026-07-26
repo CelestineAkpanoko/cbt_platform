@@ -1,0 +1,28 @@
+<svg>
+  <!-- One-glance layout: big CBT number, colored level bar under it,
+       secondary row for HR / ambient, small status corners. -->
+  <rect id="level-bar" x="0" y="0" width="100%" height="28" fill="#5a6b7b" />
+  <text id="level" x="50%" y="21" text-anchor="middle"
+        fill="white" font-size="20" font-weight="bold">NO DATA</text>
+
+  <text id="cbt" x="50%" y="55%" text-anchor="middle"
+        font-size="64" font-weight="bold" fill="white">--.-°C</text>
+
+  <text id="hr" x="8" y="78%" font-size="26" fill="#c8d2dc">HR --</text>
+  <text id="ambient" x="98%" y="78%" text-anchor="end" font-size="26"
+        fill="#c8d2dc">Amb --°C</text>
+
+  <!-- Independent NIOSH HR warning: purple, its own slot, never replaces
+       the level bar. Hidden unless hrLimitExceeded === true. -->
+  <text id="hr-warning" x="8" y="88%" font-size="22" fill="#a97fe0"
+        display="none">HR LIMIT EXCEEDED</text>
+
+  <!-- Provisional-baseline tag: small, gray-blue, bottom-right; a
+       calibration note, deliberately unlike the alert-level styling. -->
+  <text id="provisional" x="98%" y="88%" text-anchor="end" font-size="18"
+        fill="#7fa8d0" display="none">BASELINE CALIBRATING</text>
+
+  <text id="age-since" x="8" y="97%" font-size="18" fill="#8a97a4"></text>
+  <text id="conn" x="98%" y="97%" text-anchor="end" font-size="18"
+        fill="#5a6b7b">○</text>
+</svg>
