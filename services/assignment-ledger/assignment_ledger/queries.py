@@ -11,11 +11,53 @@ from typing import Optional
 
 from boto3.dynamodb.conditions import Key
 
+from cbt_shared.models import DEVICE_TYPES, DeviceTypeError
+
+
+def _check_device_type(device_type: str) -> str:
+    """DeviceAssignments holds exclusive-wear hardware only. fitbit and
+    clarity each have their own home (see cbt_shared.models.DEVICE_TYPES);
+    catching them here stops a caller silently querying a partition that
+    can never have rows and reading the miss as "unassigned"."""
+    if device_type not in DEVICE_TYPES:
+        raise DeviceTypeError(
+            f"{device_type!r} is not a DeviceAssignments device type "
+            f"{DEVICE_TYPES}. fitbit -> participant_by_fitbit_id(); "
+            f"clarity -> participants_at_site()."
+        )
+    return device_type
+
+
+def participant_by_fitbit_id(participants, fitbit_id: str) -> Optional[dict]:
+    """The participant who owns this Fitbit account, or None.
+
+    A fitbit_id is an OAuth account identifier minted against one person's
+    email, so this is a direct 1:1 binding — there is no time window and no
+    "previous wearer". Replaces the old
+    current_device_assignment(devices, "fitbit", ...) call, which modelled
+    a Fitbit account as loanable hardware and let a second enrollment
+    silently take over the first participant's data.
+    """
+    rows = participants.query("fitbit_id_pk", participants.scoped(fitbit_id),
+                              index_name="ByFitbitId")
+    return rows[0] if rows else None
+
+
+def all_participants(participants) -> list[dict]:
+    """Every person record in this org, via the sparse ByOrg GSI.
+
+    Uniqueness-marker items (pk = org#uniq#...) carry no org_pk, so they
+    are not in the index — this returns exactly the participants, without
+    a Scan and without escaping the org's key scope.
+    """
+    return participants.query("org_pk", participants.scoped("participant"),
+                              index_name="ByOrg")
+
 
 def current_device_assignment(device_table, device_type: str,
                               device_id: str) -> Optional[dict]:
     """Active assignment row for a device, or None (in inventory / between wearers)."""
-    pk = device_table.scoped(device_type, device_id)
+    pk = device_table.scoped(_check_device_type(device_type), device_id)
     items = device_table.query("pk", pk, ScanIndexForward=False, Limit=1)
     if items and "is_current" in items[0]:
         return items[0]
@@ -59,11 +101,15 @@ def participant_at(device_table, device_type: str, device_id: str,
     """Full-history point-in-time resolution: who wore this device at
     `timestamp` (ISO 8601)?
 
-    This is the query the future offline-retraining phase will use to route
-    historical raw files to the right participant. Returns the assignment
-    row, or None if the device was unassigned at that moment.
+    This is the query that routes a landed Cosinuss session to the person
+    who was actually wearing that receiver when the session started — the
+    only correct answer when a receiver changes wearer mid-study (ZC5C5W
+    moved from user11 to user101 on 2026-07-24, and every file for both
+    sits under the same receiver id). Also what offline retraining uses to
+    re-attribute historical raw files. Returns the assignment row, or None
+    if the device was unassigned at that moment.
     """
-    pk = device_table.scoped(device_type, device_id)
+    pk = device_table.scoped(_check_device_type(device_type), device_id)
     # Latest window opened at or before `timestamp`
     items = device_table.query(
         "pk", pk,
@@ -80,7 +126,12 @@ def participant_at(device_table, device_type: str, device_id: str,
 
 
 def all_current_device_assignments(device_table) -> list[dict]:
-    """Every device with an active wearer in this org (sparse Current GSI)."""
+    """Every device with an active wearer in this org (sparse Current GSI).
+
+    Cosinuss only — Fitbit accounts are not in this table (see
+    cbt_shared.models.DEVICE_TYPES). Callers that used to filter this list
+    down to device_type == "fitbit" now read Participants.fitbit_id.
+    """
     return device_table.query("is_current", device_table.org_id,
                               index_name="Current")
 

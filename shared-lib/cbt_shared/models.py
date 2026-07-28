@@ -17,8 +17,34 @@ POPULATION_BASELINE = {
     "baseline_skin_temp": 33.5,
 }
 
-DEVICE_TYPES = ("fitbit", "cosinuss")
+# Device types that live in the DeviceAssignments ledger: physically
+# scarce hardware handed from one wearer to the next, so "who is wearing
+# device X right now" is a real question with a time-varying answer.
+#
+# Fitbit is deliberately NOT here. A fitbit_id is Fitbit's OAuth account
+# identifier — a token minted against one person's email, proven by that
+# person completing the OAuth flow. It is not a limited pool, it is never
+# handed to the next participant, and modelling it as reassignable created
+# a silent account-takeover path (enrolling B with A's already-linked
+# Fitbit closed A's window and moved A's data to B). It now lives as
+# Participant.fitbit_id, uniqueness-enforced. See docs/data-model.md.
+DEVICE_TYPES = ("cosinuss",)
+
+# Clarity environmental stations are also a limited pool, but shared:
+# many participants can be covered by one station at the same time. They
+# are therefore tracked in SiteAssignments (many-to-one SCD2), not
+# DeviceAssignments (one-to-one). site_id IS the Clarity device id.
+SITE_DEVICE_TYPE = "clarity"
+
+# Everything with a bounded, enumerable id space that enrollment has to
+# pick from — the union of both ledgers' device kinds.
+POOLED_DEVICE_TYPES = DEVICE_TYPES + (SITE_DEVICE_TYPE,)
+
 ENROLLMENT_MODES = ("research", "production")
+
+
+class DeviceTypeError(ValueError):
+    """A device type was used with the wrong ledger."""
 
 
 @dataclass
@@ -37,6 +63,14 @@ class Participant:
     user_id: str  # legacy-compatible "user{number}" identifier
     email: Optional[str]
     display_name: str
+    # Fitbit's OAuth account id, captured from the OAuth exchange — the
+    # third natural identifier for a participant, alongside user_id and
+    # email, and the strongest of the three because holding it proves the
+    # person controls that Fitbit account. Unique per participant
+    # (org_id#uniq#fitbit_id#<id> marker + ByFitbitId GSI). Optional
+    # because legacy-migrated rows predate it and because a participant
+    # can exist before connecting a Fitbit.
+    fitbit_id: Optional[str]
     sex: str
     height_in: float
     weight_lbs: float
@@ -61,6 +95,13 @@ class Participant:
     def to_item(self) -> dict:
         item = {k: v for k, v in asdict(self).items() if v is not None}
         item["pk"] = self.pk()
+        # Hash key of the ByOrg GSI. Constant per org, so "every
+        # participant in this org" is one indexed query rather than a
+        # Scan — and unlike a Scan it still carries the org_id, which is
+        # what tests/test_tenancy.py enforces. Uniqueness-marker items
+        # (pk = org#uniq#...) deliberately omit it, so the index holds
+        # exactly the person records.
+        item["org_pk"] = f"{self.org_id}#participant"
         return item
 
 
@@ -68,19 +109,43 @@ class Participant:
 class DeviceAssignment:
     """SCD Type 2 row: one wearer per device at any point in time.
 
+    Only DEVICE_TYPES belong here — exclusive, physically-shared hardware.
+    Passing "fitbit" raises: a Fitbit account is a participant attribute,
+    not a device on loan (see DEVICE_TYPES). Passing "clarity" raises too:
+    stations are shared by many participants at once, so they live in
+    SiteAssignment.
+
     effective_from/effective_to are *valid time* only. Transaction time
     (recorded_at bitemporal tracking) is deliberately deferred — see
     docs/data-model.md "Known limitations".
     """
 
     org_id: str
-    device_type: str  # fitbit | cosinuss
+    device_type: str  # cosinuss (the only exclusive-wear device type)
     device_id: str
     participant_id: str
     role: str  # research | production
     effective_from: str  # ISO 8601
     effective_to: Optional[str] = None  # None = current
     is_current: Optional[bool] = None  # present only on the current row (sparse GSI)
+
+    def __post_init__(self):
+        if self.device_type == "fitbit":
+            raise DeviceTypeError(
+                "fitbit is not a ledger device — a Fitbit account id is "
+                "Participant.fitbit_id (unique per person), not an "
+                "assignment window. See docs/data-model.md."
+            )
+        if self.device_type == SITE_DEVICE_TYPE:
+            raise DeviceTypeError(
+                "clarity stations are shared by many participants at once — "
+                "record them as a SiteAssignment, not a DeviceAssignment."
+            )
+        if self.device_type not in DEVICE_TYPES:
+            raise DeviceTypeError(
+                f"unknown device type {self.device_type!r}; expected one of "
+                f"{DEVICE_TYPES}"
+            )
 
     def pk(self) -> str:
         return f"{self.org_id}#{self.device_type}#{self.device_id}"

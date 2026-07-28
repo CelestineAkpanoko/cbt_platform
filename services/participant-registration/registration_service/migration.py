@@ -72,11 +72,17 @@ def migrate_legacy_users(participants: ScopedTable, users_json: dict,
             }
 
         email = email_roster.get(user_id)
+        # users.json already records each participant's Fitbit account id;
+        # it is the same value the OAuth exchange returns and the same one
+        # raw data lands under, so it binds directly onto the participant.
+        # No DeviceAssignment window is (or ever was) needed for it.
+        fitbit_id = rec.get("fitbit_id") or None
         p = Participant(
             org_id=participants.org_id,
             participant_id=f"p-{uuid.uuid4().hex[:12]}",
             user_id=user_id,
             email=email.lower() if email else None,
+            fitbit_id=fitbit_id,
             display_name=rec.get("display_name", user_id),
             sex=demographics.get("sex", "unknown"),
             height_in=demographics.get("height_in", 0),
@@ -94,18 +100,24 @@ def migrate_legacy_users(participants: ScopedTable, users_json: dict,
         item["user_id_pk"] = participants.scoped(user_id)
         if email:
             item["email_pk"] = participants.scoped(email.lower())
-        # Kept for the runbook's device-reassignment step (Section 3b): the
-        # last known device this user had, before any effective-dated
-        # DeviceAssignment window exists for them.
-        if rec.get("fitbit_id"):
-            item["legacy_fitbit_id"] = rec["fitbit_id"]
+        if fitbit_id:
+            item["fitbit_id_pk"] = participants.scoped(fitbit_id)
+        # Kept for the runbook's cosinuss-reassignment step (Section 3b):
+        # the last known receiver this user had, before any effective-dated
+        # DeviceAssignment window exists for them. There is no
+        # legacy_fitbit_id equivalent — fitbit_id is a live field now, not
+        # something needing backfill into a separate ledger.
         if rec.get("cosinuss_id"):
             item["legacy_cosinuss_id"] = rec["cosinuss_id"]
         participants.put_item(item)
-        # claim the user_id uniqueness marker (same guard native creates use)
-        participants.put_item({"pk": participants.scoped("uniq", "user_id", user_id)})
-        if email:
-            participants.put_item({"pk": participants.scoped("uniq", "email", email.lower())})
+        # claim the uniqueness markers (same guards native creates use)
+        for kind, value in (("user_id", user_id), ("email", email and email.lower()),
+                            ("fitbit_id", fitbit_id)):
+            if value:
+                participants.put_item({
+                    "pk": participants.scoped("uniq", kind, value),
+                    "participant_id": p.participant_id,
+                })
         migrated.append(user_id)
     return migrated
 

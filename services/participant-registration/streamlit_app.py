@@ -17,13 +17,23 @@ Flow (OAuth must come first: the OAuth redirect reloads the page with
      tokens/{fitbit_id}.json is stamped with the participant_id after
      enrollment.
 
-Device inventory: derived live from the raw sensor bucket — the pull
-Lambdas land data under fitbit/raw/<id>/, cosinuss/raw/<id>/ and
-clarity/raw/<date>/<clarity_id>_*.json, so the bucket itself is the list
-of known devices (see registration_service/s3_inventory.py). Cosinuss and
-Clarity dropdowns come from there, each with an "Other (new device)"
-free-text fallback for hardware that hasn't uploaded yet. site_id IS the
-Clarity device id — no separate location abstraction.
+Identity: the fitbit_id from the OAuth step is a PROVEN identifier (only
+the account holder can complete the flow), while user_id and email are
+typed and therefore merely claimed. register() enforces that a claimed
+identifier can never override a proven one, so a participant cannot be
+enrolled onto someone else's Fitbit account — see the
+FitbitAccountInUseError branch below and registration_service.service.
+
+Device inventory (see registration_service/s3_inventory.py):
+  Cosinuss  receivers from the raw bucket's cosinuss/raw/ prefixes plus the
+            puller's state file, minus any currently worn. A real pool.
+  Clarity   station ids read from the `datasourceId` column inside a recent
+            clarity/raw/<date>/<timestamp>.csv — they are not in the key,
+            so they cannot be listed as prefixes. site_id IS the Clarity
+            device id; no separate location abstraction.
+  Fitbit    NOT a pool. Captured from OAuth, one account per person.
+Both dropdowns keep an "Other" free-text fallback for hardware that hasn't
+reported yet.
 
 All enrollment business logic lives in registration_service.register()
 (fully unit-tested); this file is UI + OAuth + AWS wiring only.
@@ -57,9 +67,11 @@ import streamlit as st
 from cbt_shared.tenancy import ScopedTable
 from registration_service import (
     DuplicateSubmissionError,
+    FitbitAccountInUseError,
     RegistrationRequest,
     ValidationError,
-    list_wearable_ids,
+    list_clarity_station_ids,
+    list_cosinuss_receivers,
     register,
     unassigned_devices,
 )
@@ -125,21 +137,17 @@ S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
 # silently kills that participant's ingestion (root-caused 2026-07-12 with
 # user14: token written to fitbit-tokens/, puller reading fitbit_tokens/).
 S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit_tokens/")
-# The raw sensor bucket doubles as the device inventory for Fitbit/Cosinuss
-# (see module docstring) — folder-per-device-id, so prefix listing works.
-# Clarity does NOT use this: its raw data is per-minute CSVs (columns like
-# datasourceid/sourceid), not a per-device folder — so there is no
-# automatic Clarity/site dropdown. The research admin types the Clarity
-# device id directly (see Step 3), same as org_id, but it's validated
-# against KNOWN_CLARITY_IDS below rather than accepted unchecked.
+# The raw sensor bucket doubles as the device inventory (see module
+# docstring): folder-per-receiver for Cosinuss, and for Clarity the
+# datasourceId column read out of a recent raw CSV.
 RAW_BUCKET = conf("RAW_BUCKET", "raw-data-all-sensors-782329476642-us-east-1-an")
 
-# Comma-separated whitelist of valid Clarity device ids for this study
-# (currently just one station: DGFVZ0274). A typed site_id that doesn't
-# match gets rejected with a clear "contact the research admin" message
-# instead of silently misattributing environmental data. Empty/unset =
-# validation is skipped entirely (useful if a future org hasn't fixed
-# its station roster yet).
+# Comma-separated Clarity station ids, UNIONED with the ones derived from
+# the bucket (currently DGFVZ0274 reports there on its own). Keep it for a
+# station that is installed but not yet reporting; it is no longer the
+# only source. A site_id matching neither is rejected with a "contact the
+# research admin" message instead of silently misattributing environmental
+# data.
 KNOWN_CLARITY_IDS = [c.strip() for c in (conf("CLARITY_ID", "") or "").split(",")
                      if c.strip()]
 
@@ -168,7 +176,27 @@ _s3 = _session.client("s3")
 
 @st.cache_data(ttl=300)
 def known_cosinuss_ids() -> list[str]:
-    return list_wearable_ids(_s3, RAW_BUCKET, "cosinuss")
+    return list_cosinuss_receivers(_s3, RAW_BUCKET)
+
+
+@st.cache_data(ttl=300)
+def known_clarity_ids() -> list[str]:
+    """Clarity stations actually reporting into the raw bucket, unioned
+    with any configured in CLARITY_ID.
+
+    Clarity ids are NOT derivable from prefixes — the station id is the
+    `datasourceId` column inside clarity/raw/<date>/<timestamp>.csv — so
+    this reads a recent file rather than listing folders. The env var
+    stays as a supplement for a station that is installed but not yet
+    reporting; it is no longer the only source, which is what forced the
+    old "type it and hope" free-text field.
+    """
+    derived = []
+    try:
+        derived = list_clarity_station_ids(_s3, RAW_BUCKET)
+    except Exception:
+        pass
+    return sorted(set(derived) | set(KNOWN_CLARITY_IDS))
 
 
 # ---------------------------------------------------------------------------
@@ -228,14 +256,18 @@ if "fitbit" not in st.session_state:
             "After you log in and approve, we'll continue to enrollment.</div>",
             unsafe_allow_html=True,
         )
-        # st.info(
-        #     "**Connecting a different Fitbit account than the one already "
-        #     "logged into this browser?** Fitbit will silently reconnect the "
-        #     "same account instead of prompting you to log in again, unless "
-        #     "you first log out at fitbit.com, or open this page in a "
-        #     "private/incognito window.",
-        #     icon="⚠️",
-        # )
+        # Re-enabled deliberately: this is the primary defence against
+        # enrolling one participant onto another's Fitbit account. The
+        # server-side guardrail (FitbitAccountInUseError) catches it either
+        # way, but catching it here costs nobody a failed registration.
+        st.info(
+            "**Connecting a different Fitbit account than the one already "
+            "logged into this browser?** Fitbit will silently reconnect the "
+            "same account instead of prompting you to log in again, unless "
+            "you first log out at fitbit.com, or open this page in a "
+            "private/incognito window.",
+            icon="⚠️",
+        )
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
         # verifier travels in `state` so the callback can recover it even if
@@ -409,21 +441,22 @@ with st.form("enroll"):
     weight_lbs = st.number_input("Weight (lbs)", 60.0, 500.0, 160.0)
     race = st.text_input("Race/ethnicity")
 
-    # site_id IS the Clarity environmental station's device id — typed
-    # directly, not derived from S3 (Clarity's raw data is per-minute CSVs,
-    # not a per-device folder like Fitbit/Cosinuss). Checked against
-    # KNOWN_CLARITY_IDS on submit below rather than accepted unchecked.
-    site_id = st.text_input(
+    # site_id IS the Clarity environmental station's device id. Now a
+    # dropdown of stations actually reporting into the raw bucket (read
+    # out of the datasourceId column — Clarity has no per-device folder to
+    # list), with a free-text fallback for a unit that is installed but
+    # hasn't reported yet.
+    clarity_pool = known_clarity_ids()
+    site_pick = st.selectbox(
         "Clarity device ID (work site's environmental sensor)",
-        help=(
-            f"Must match a registered station for this study "
-            f"({', '.join(KNOWN_CLARITY_IDS)}). Contact the research admin "
-            f"if you don't have the correct ID — do not guess."
-            if KNOWN_CLARITY_IDS else
-            "The Clarity unit currently covering this participant's work "
-            "site — this is its datasourceid. Ask the site organizer if "
-            "unsure — do not guess."
-        ),
+        clarity_pool + [OTHER_OPTION],
+        help="Stations currently reporting data for this study. Pick the "
+             "unit covering this participant's work site — ask the site "
+             "organizer if unsure, do not guess.",
+    ) if clarity_pool else None
+    site_other = st.text_input(
+        "If the Clarity station isn't listed, type its ID here",
+        help="Its datasourceid, e.g. DGFVZ0274.",
     )
 
     cosinuss_pick = cosinuss_other = None
@@ -450,12 +483,17 @@ def _resolve_pick(pick, other):
     return ""
 
 if submitted:
-    site_id = (site_id or "").strip()
-    if KNOWN_CLARITY_IDS and site_id not in KNOWN_CLARITY_IDS:
+    site_id = _resolve_pick(site_pick, site_other).strip()
+    if not site_id:
+        st.error("A Clarity station is required — pick one or type its ID.")
+        st.stop()
+    known_stations = known_clarity_ids()
+    if known_stations and site_id not in known_stations:
         st.error(
-            f"'{site_id}' isn't a recognized Clarity device for this study. "
-            "No registration was created. Please double-check the ID with "
-            "the research admin or support team, then try again."
+            f"'{site_id}' isn't a recognized Clarity station for this study "
+            f"(known: {', '.join(known_stations)}). No registration was "
+            "created. Please double-check the ID with the research admin or "
+            "support team, then try again."
         )
         st.stop()
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
@@ -471,6 +509,21 @@ if submitted:
     )
     try:
         result = register(_client, participants, devices, sites, req)
+    except FitbitAccountInUseError as e:
+        # The connected Fitbit account belongs to someone else. Almost
+        # always the browser silently re-approved a previous participant's
+        # Fitbit session rather than anyone acting in bad faith — so lead
+        # with the fix, not an accusation. Nothing was written.
+        st.error(f"**We did not save this registration.** {e}")
+        st.info(
+            "**How to connect the right account:** log out at "
+            "[fitbit.com](https://www.fitbit.com/logout) *or* reopen this "
+            "page in a private/incognito window, then use "
+            "**Connect a different Fitbit device** above. Fitbit re-approves "
+            "an already-signed-in account without prompting for a login, "
+            "which is how the wrong one gets connected.",
+            icon="🔑",
+        )
     except ValidationError as e:
         st.error(str(e))
     except DuplicateSubmissionError:
@@ -502,6 +555,12 @@ if submitted:
                 f"Welcome back! Re-enrolled existing participant "
                 f"{result.participant_id} (matched on {result.matched_on})."
             )
+            if result.matched_on and "fitbit_id" in result.matched_on:
+                st.caption(
+                    "Recognised from the connected Fitbit account — the "
+                    "strongest match we have, since only the account holder "
+                    "can complete that step."
+                )
         st.info(
             "You can close this page. To enroll another participant, reopen "
             "the link fresh (each participant connects their own Fitbit)."

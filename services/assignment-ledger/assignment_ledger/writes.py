@@ -106,6 +106,12 @@ def assign_device(client, device_table: ScopedTable, *, device_type: str,
                   expected_current=_READ_NOW) -> DeviceAssignment:
     """Open a new device→participant window, closing any active one.
 
+    Exclusive-wear hardware only (cbt_shared.models.DEVICE_TYPES). Calling
+    this with "fitbit" raises DeviceTypeError from DeviceAssignment — that
+    used to be the account-takeover path: the transaction below would
+    dutifully close the first participant's window and hand their Fitbit
+    (and therefore their raw data) to whoever registered next.
+
     expected_current: the assignment state the caller observed (e.g. when
     the enrollment form rendered its device pick list) — None for "device
     was free". The transaction conditions on it, so a stale view fails with

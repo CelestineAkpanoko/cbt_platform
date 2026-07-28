@@ -1,6 +1,8 @@
 from .tables import create_tables, TABLE_NAMES
 from .writes import assign_device, assign_site, DeviceJustReassignedError
 from .queries import (
+    all_participants,
+    participant_by_fitbit_id,
     current_device_assignment,
     current_site_for_participant,
     participant_at,
@@ -15,6 +17,8 @@ __all__ = [
     "assign_device",
     "assign_site",
     "DeviceJustReassignedError",
+    "all_participants",
+    "participant_by_fitbit_id",
     "current_device_assignment",
     "current_site_for_participant",
     "participant_at",
