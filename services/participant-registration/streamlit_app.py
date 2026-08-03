@@ -64,17 +64,46 @@ import boto3
 import requests
 import streamlit as st
 
-from cbt_shared.tenancy import ScopedTable
-from registration_service import (
-    DuplicateSubmissionError,
-    FitbitAccountInUseError,
-    RegistrationRequest,
-    ValidationError,
-    list_clarity_station_ids,
-    list_cosinuss_receivers,
-    register,
-    unassigned_devices,
-)
+# These come from sibling packages resolved through the sys.path setup
+# above, NOT from installed distributions — so on Streamlit Cloud they are
+# whatever is in its checkout of the repo. A checkout that is partially
+# stale (this file updated, the packages not) fails here with a bare
+# "cannot import name X", which looks like a code bug and is not one: the
+# fix is always to reboot the app, because a *rerun* re-executes the
+# script against the existing checkout while only a *reboot* re-clones.
+# Catching it turns a traceback nobody can act on into an instruction.
+try:
+    from cbt_shared.tenancy import ScopedTable
+    from registration_service import (
+        DuplicateSubmissionError,
+        FitbitAccountInUseError,
+        RegistrationRequest,
+        ValidationError,
+        list_clarity_station_ids,
+        list_cosinuss_receivers,
+        register,
+        unassigned_devices,
+    )
+except ImportError as _exc:
+    st.error(
+        "**This app is running a stale copy of the code.**\n\n"
+        f"`{_exc}`\n\n"
+        "The enrollment logic lives in sibling packages in this repository "
+        "(`registration_service`, `assignment_ledger`, `cbt_shared`). This "
+        "error means the deployment picked up a newer version of the app "
+        "file than of those packages, so nothing here can run."
+    )
+    st.info(
+        "**Fix:** in the Streamlit Cloud dashboard, open **Manage app → ⋮ → "
+        "Reboot app**.\n\n"
+        "A *rerun* only re-executes the script against the existing "
+        "checkout — only a **reboot** pulls the repository again. If a "
+        "reboot does not clear it, use **Clear cache** and reboot, then as "
+        "a last resort delete and redeploy the app from the same repo and "
+        "branch.",
+        icon="🔄",
+    )
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Config (st.secrets on Streamlit Cloud, env vars locally)
@@ -131,12 +160,21 @@ SCOPES = (
 DEFAULT_ORG_ID = conf("CBT_ORG_ID", "org1")
 AWS_REGION = conf("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
-# MUST match the pull Lambda's TOKEN_PREFIX (fitbit_tokens/, underscore).
-# A re-registration rotates the Fitbit grant — the old refresh token dies —
-# so if this prefix diverges from the puller's, every re-registration
-# silently kills that participant's ingestion (root-caused 2026-07-12 with
-# user14: token written to fitbit-tokens/, puller reading fitbit_tokens/).
-S3_TOKEN_PREFIX = conf("S3_TOKEN_PREFIX", "fitbit_tokens/")
+# NOT configurable, on purpose. This must match the pull Lambda's
+# TOKEN_PREFIX exactly: a re-registration rotates the Fitbit grant, killing
+# the old refresh token, so a writer and reader that disagree about the
+# prefix silently end that participant's ingestion.
+#
+# It was configurable via an S3_TOKEN_PREFIX secret, and that footgun fired
+# twice. 2026-07-12: user14's token written to fitbit-tokens/ (hyphen)
+# while the puller read fitbit_tokens/ (underscore). 2026-08-02: four newly
+# authorized accounts (DDV4XG, DDV99N, DDVJF5, DDVK47) landed in the
+# hyphenated prefix again. Both times the code default was correct and a
+# deployment secret overrode it — so the default is not the thing to fix.
+#
+# Any S3_TOKEN_PREFIX value still set in Streamlit Cloud secrets is now
+# inert; delete it at your leisure.
+S3_TOKEN_PREFIX = "fitbit_tokens/"
 # The raw sensor bucket doubles as the device inventory (see module
 # docstring): folder-per-receiver for Cosinuss, and for Clarity the
 # datasourceId column read out of a recent raw CSV.
