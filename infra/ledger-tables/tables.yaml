@@ -1,0 +1,188 @@
+# CloudFormation: identity/assignment ledger tables.
+# Keep in sync with services/assignment-ledger/assignment_ledger/tables.py
+# (that module is the spec of record; tests create tables from it).
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CBT platform identity ledger (Participants, DeviceAssignments, SiteAssignments, CalibrationHistory)
+
+# DynamoDB permits exactly ONE global secondary index to be created per
+# UpdateTable call, and CloudFormation does not sequence them for you — a
+# template that adds two at once fails the whole stack update with
+#   "Cannot perform more than one GSI creation or deletion in a single update"
+# and rolls back. This rollout adds two (ByOrg and ByFitbitId), so it is
+# staged: deploy with IndexRollout=stage1 to add ByOrg, wait for it to go
+# ACTIVE, then deploy with IndexRollout=complete to add ByFitbitId.
+# ops/deploy.sh does both passes and the waiting automatically.
+Parameters:
+  IndexRollout:
+    Type: String
+    Default: complete
+    AllowedValues: [stage1, complete]
+    Description: >
+      stage1 = ByOrg only (first pass); complete = ByOrg + ByFitbitId.
+      Always finish at complete — stage1 is a transient state, and leaving
+      the stack there means ByFitbitId does not exist, which silently
+      breaks every ?fitbit_id= lookup and all Fitbit file attribution.
+
+Conditions:
+  # AttributeDefinitions must list exactly the attributes used by a key
+  # schema — DynamoDB rejects an unused one — so fitbit_id_pk has to appear
+  # and disappear together with the index that uses it.
+  WithFitbitIdIndex: !Equals [!Ref IndexRollout, complete]
+
+Resources:
+  ParticipantsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: Participants
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: !If
+        - WithFitbitIdIndex
+        - - {AttributeName: pk, AttributeType: S}
+          - {AttributeName: user_id_pk, AttributeType: S}
+          - {AttributeName: email_pk, AttributeType: S}
+          - {AttributeName: org_pk, AttributeType: S}
+          - {AttributeName: fitbit_id_pk, AttributeType: S}
+        - - {AttributeName: pk, AttributeType: S}
+          - {AttributeName: user_id_pk, AttributeType: S}
+          - {AttributeName: email_pk, AttributeType: S}
+          - {AttributeName: org_pk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+      GlobalSecondaryIndexes: !If
+        - WithFitbitIdIndex
+        # --- complete: both new indexes present -------------------------
+        - - IndexName: ByUserId
+            KeySchema: [{AttributeName: user_id_pk, KeyType: HASH}]
+            Projection: {ProjectionType: ALL}
+          - IndexName: ByEmail   # sparse: legacy records without email are unindexed
+            KeySchema: [{AttributeName: email_pk, KeyType: HASH}]
+            Projection: {ProjectionType: ALL}
+          # "every participant in this org" without a Scan. Sparse:
+          # uniqueness markers carry no org_pk.
+          - IndexName: ByOrg
+            KeySchema:
+              - {AttributeName: org_pk, KeyType: HASH}
+              - {AttributeName: pk, KeyType: RANGE}
+            Projection: {ProjectionType: ALL}
+          # sparse: a participant who hasn't connected a Fitbit is unindexed.
+          # Replaces the removed "current wearer of fitbit X" ledger query.
+          - IndexName: ByFitbitId
+            KeySchema: [{AttributeName: fitbit_id_pk, KeyType: HASH}]
+            Projection: {ProjectionType: ALL}
+        # --- stage1: ByOrg only, so this update adds exactly one index ---
+        - - IndexName: ByUserId
+            KeySchema: [{AttributeName: user_id_pk, KeyType: HASH}]
+            Projection: {ProjectionType: ALL}
+          - IndexName: ByEmail
+            KeySchema: [{AttributeName: email_pk, KeyType: HASH}]
+            Projection: {ProjectionType: ALL}
+          - IndexName: ByOrg
+            KeySchema:
+              - {AttributeName: org_pk, KeyType: HASH}
+              - {AttributeName: pk, KeyType: RANGE}
+            Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  DeviceAssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: DeviceAssignments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: participant_pk, AttributeType: S}
+        - {AttributeName: is_current, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: ByParticipant
+          KeySchema:
+            - {AttributeName: participant_pk, KeyType: HASH}
+            - {AttributeName: sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: Current   # sparse; is_current holds the org_id
+          KeySchema:
+            - {AttributeName: is_current, KeyType: HASH}
+            - {AttributeName: pk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  SiteAssignmentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: SiteAssignments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: site_pk, AttributeType: S}
+        - {AttributeName: is_current, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: BySite
+          KeySchema:
+            - {AttributeName: site_pk, KeyType: HASH}
+            - {AttributeName: sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: Current
+          KeySchema:
+            - {AttributeName: is_current, KeyType: HASH}
+            - {AttributeName: pk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  CalibrationHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: CalibrationHistory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: computed_at, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: computed_at, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+  RegistryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: Registry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}   # kind: org | cosinuss | clarity
+        - {AttributeName: sk, AttributeType: S}   # the id
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+
+Outputs:
+  # Published so the materialize and calibration stacks (deployed
+  # separately) can subscribe their Lambdas to these streams via
+  # !ImportValue — see infra/materialize/template.yaml and
+  # infra/calibration/template.yaml.
+  ParticipantsStreamArn:
+    # fitbit_id lives on Participants now, and both users.json and
+    # config/user_mapping.json key on it — so the materializer subscribes
+    # to this stream as well as the assignment ones.
+    Value: !GetAtt ParticipantsTable.StreamArn
+    Export: {Name: ParticipantsStreamArn}
+  DeviceAssignmentsStreamArn:
+    Value: !GetAtt DeviceAssignmentsTable.StreamArn
+    Export: {Name: DeviceAssignmentsStreamArn}
+  SiteAssignmentsStreamArn:
+    Value: !GetAtt SiteAssignmentsTable.StreamArn
+    Export: {Name: SiteAssignmentsStreamArn}

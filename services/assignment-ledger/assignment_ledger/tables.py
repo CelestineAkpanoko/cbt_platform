@@ -12,6 +12,7 @@ TABLE_NAMES = {
     "device_assignments": "DeviceAssignments",
     "site_assignments": "SiteAssignments",
     "calibration_history": "CalibrationHistory",
+    "registry": "Registry",
 }
 
 TABLE_SPECS = [
@@ -152,6 +153,22 @@ TABLE_SPECS = [
         "AttributeDefinitions": [
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "computed_at", "AttributeType": "S"},
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+    },
+    {
+        # Admin-managed dropdown registry: pk is the entity kind
+        # ("org" | "cosinuss" | "clarity"), sk is the id itself. Items
+        # carry name/location/active. Deliberately NOT org-scoped —
+        # orgs themselves live here, and device hardware is shared.
+        "TableName": TABLE_NAMES["registry"],
+        "KeySchema": [
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
         ],
         "BillingMode": "PAY_PER_REQUEST",
     },
