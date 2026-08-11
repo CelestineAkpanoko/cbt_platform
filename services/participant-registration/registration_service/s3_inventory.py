@@ -33,6 +33,7 @@ import csv
 import io
 import json
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -190,3 +191,22 @@ def station_ids_in_clarity_csv(body: bytes) -> set[str]:
         for row in reader
         if row.get(column) and row[column].strip()
     }
+
+
+def first_fitbit_data_date(s3_client, bucket: str, fitbit_id: str):
+    """Earliest date this Fitbit account produced raw data, as an ISO 8601
+    UTC instant ("YYYY-MM-DDT00:00:00Z"), or None if it never has.
+
+    Used to BACKDATE a (re-)registration: after the ledger tables were
+    wiped, re-registering everyone would otherwise stamp today's date as
+    enrolled_at / effective_from, which mis-scopes calibration windows and
+    historical attribution. The account's first raw-data day under
+    fitbit/raw/<fitbit_id>/<date>/ is the durable record of when they
+    actually joined — the raw bucket is append-only and survived the wipe.
+    """
+    date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    days = [d for d in _common_prefixes(
+        s3_client, bucket, f"fitbit/raw/{fitbit_id}/") if date_re.match(d)]
+    if not days:
+        return None
+    return f"{min(days)}T00:00:00Z"

@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
                                 "services", "admin-portal"))
 
 from admin_service import org_rollout_status, sync_org_to_lambdas  # noqa: E402
-from ops.add_org import ORG_AWARE_FUNCTIONS
+from cbt_shared.org_functions import ORG_AWARE_FUNCTIONS
 
 
 class _Waiter:

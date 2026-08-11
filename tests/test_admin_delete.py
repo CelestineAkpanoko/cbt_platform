@@ -76,3 +76,27 @@ def test_delete_missing_participant_raises(participants, devices, sites,
     with pytest.raises(ParticipantNotFoundError):
         delete_participant(participants, devices, sites, calibration_table,
                            "nope")
+
+
+def test_calibration_overview_reports_each_participant(
+        dynamodb, dynamo_client, participants, devices, sites,
+        calibration_table):
+    from admin_service import calibration_overview
+
+    result = register(dynamo_client, participants, devices, sites, _req())
+    rows = calibration_overview(participants, calibration_table)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "waiting for first sweep"
+    assert rows[0]["enrolled_at"] == T0[:10]
+
+    # A completed calibration for the current enrollment window shows up.
+    calibration_table.raw.put_item(Item={
+        "pk": f"org1#{result.participant_id}",
+        "computed_at": "2026-07-05T00:00:00Z",
+        "assignment_effective_from": T0,
+        "calibration_status": "complete",
+        "nights_used": 3,
+    })
+    rows = calibration_overview(participants, calibration_table)
+    assert rows[0]["status"] == "complete"
+    assert rows[0]["nights"] == 3

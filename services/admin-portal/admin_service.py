@@ -18,9 +18,10 @@ from assignment_ledger.queries import (
 from assignment_ledger.writes import HEAD_SK
 from cbt_shared.tenancy import ScopedTable
 
-# The table of Lambdas that must know the full tenant list lives in
-# ops/add_org.py (spec of record — the CLI and this portal must agree).
-from ops.add_org import ORG_AWARE_FUNCTIONS, current_orgs
+# The table of Lambdas that must know the full tenant list. Lives in
+# cbt_shared (deployed with the git checkout) — NOT in ops/, which is
+# operator-only tooling that Streamlit Cloud does not have.
+from cbt_shared.org_functions import ORG_AWARE_FUNCTIONS, current_orgs
 
 
 class ParticipantNotFoundError(KeyError):
@@ -85,6 +86,55 @@ def list_participants(participants: ScopedTable) -> list[dict]:
     """Person rows for one org (ByOrg GSI — markers excluded)."""
     return sorted(all_participants(participants),
                   key=lambda p: p.get("user_id") or p["participant_id"])
+
+
+CALIBRATION_SWEEP_FUNCTION = "calibration-sweep"
+
+
+def calibration_overview(participants: ScopedTable,
+                         calibration: ScopedTable) -> list[dict]:
+    """Per-participant calibration state for the admin portal.
+
+    The sweep Lambda itself is the look-back mechanism — it re-evaluates
+    every participant from their enrolled_at until a baseline completes —
+    so this is the matching visibility: who is calibrated, who is still
+    accumulating nights, and who can never calibrate (no Fitbit or no
+    usable enrollment date).
+    """
+    rows = []
+    for person in list_participants(participants):
+        pid = person["participant_id"]
+        entry = {
+            "user_id": person.get("user_id"),
+            "participant_id": pid,
+            "enrolled_at": (person.get("enrolled_at") or "")[:10],
+            "status": "no fitbit",
+            "nights": None,
+            "last_checked": None,
+        }
+        if person.get("fitbit_id"):
+            history = calibration.query("pk", calibration.scoped(pid))
+            window = [h for h in history
+                      if h.get("assignment_effective_from")
+                      == person.get("enrolled_at")]
+            window.sort(key=lambda h: h.get("computed_at") or "")
+            if not window:
+                entry["status"] = "waiting for first sweep"
+            else:
+                latest = window[-1]
+                entry["status"] = latest.get("calibration_status", "?")
+                entry["nights"] = latest.get("nights_used")
+                entry["last_checked"] = (latest.get("computed_at") or "")[:16]
+        rows.append(entry)
+    return rows
+
+
+def trigger_calibration_sweep(lambda_client) -> dict:
+    """Fire the sweep Lambda now instead of waiting for its schedule.
+    Async invoke — results land in CalibrationHistory within minutes."""
+    resp = lambda_client.invoke(FunctionName=CALIBRATION_SWEEP_FUNCTION,
+                                InvocationType="Event")
+    return {"status_code": resp.get("StatusCode")}
 
 
 def delete_participant(

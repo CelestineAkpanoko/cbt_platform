@@ -21,6 +21,7 @@ from .registry import (
     list_orgs,
 )
 from .s3_inventory import (
+    first_fitbit_data_date,
     list_clarity_station_ids,
     list_cosinuss_receivers,
     list_wearable_ids,
@@ -42,6 +43,7 @@ __all__ = [
     "list_cosinuss_receivers",
     "list_wearable_ids",
     "station_ids_in_clarity_csv",
+    "first_fitbit_data_date",
     "REGISTRY_TABLE_NAME",
     "RegistryError",
     "add_entry",

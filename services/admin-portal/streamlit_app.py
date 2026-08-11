@@ -4,9 +4,10 @@ What lives here (password-gated, research admins only):
 
   Organizations     add/deactivate org entries (id + name + location).
                     These feed the org dropdown on the enrollment form.
-                    NB: Lambda readers learn about a new org via
-                    `python -m ops.add_org --org <id> --commit`, not here —
-                    this portal deliberately has no Lambda permissions.
+                    Adding an org ALSO pushes it to every org-aware Lambda
+                    automatically (same merge as `ops/add_org.py --commit`),
+                    with a status board + retry button — admins never need
+                    a terminal.
   Cosinuss devices  add/deactivate receiver ids for the enrollment
                     dropdown (replaces guessing from S3 prefixes).
   Clarity stations  same, for site_id.
@@ -46,8 +47,12 @@ try:
     )
     from admin_service import (
         ParticipantNotFoundError,
+        calibration_overview,
         delete_participant,
         list_participants,
+        org_rollout_status,
+        sync_org_to_lambdas,
+        trigger_calibration_sweep,
     )
 except ImportError as _exc:
     st.error(
@@ -101,7 +106,32 @@ if _ak and _sk:
 else:
     _session = boto3.Session(region_name=AWS_REGION)
 _dynamodb = _session.resource("dynamodb")
+_lambda = _session.client("lambda")
 _registry = _dynamodb.Table(REGISTRY_TABLE_NAME)
+
+
+_SYNC_LABELS = {"added": "✅ updated", "already": "✅ already knew it",
+                "known": "✅ knows it", "missing": "❌ MISSING",
+                "not_deployed": "⚪ not deployed", "error": "⚠️ error"}
+
+
+def _show_sync_results(rows, org_id):
+    ok = all(r["status"] in ("added", "already", "known", "not_deployed")
+             for r in rows)
+    for r in rows:
+        line = f"{_SYNC_LABELS.get(r['status'], r['status'])} — `{r['function']}`"
+        if r.get("detail") and r["status"] == "error":
+            line += f": {r['detail']}"
+        st.write(line)
+    if ok:
+        st.success(f"All services now accept data for **{org_id}**. "
+                   "New registrations and sensor files for this org will "
+                   "attribute correctly.")
+    else:
+        st.error("Some services could NOT be updated (see above). Data for "
+                 f"{org_id} will be quarantined by those services until "
+                 "this is fixed — press “Sync services” below to retry, or "
+                 "contact the engineering team if the error persists.")
 
 
 def _scoped_tables(org_id: str):
@@ -138,11 +168,21 @@ def _registry_section(kind: str, label: str, *, with_location: bool):
             try:
                 add_entry(_registry, kind, new_id, name=new_name,
                           location=new_loc, created_by="admin-portal")
+            except RegistryError as exc:
+                st.error(str(exc))
+            else:
+                if kind == "org":
+                    # A new org must also be pushed to every org-aware
+                    # Lambda, or its data is silently quarantined. Done
+                    # here automatically so admins never need a terminal;
+                    # results shown after the rerun.
+                    with st.spinner("Updating platform services…"):
+                        st.session_state["org_sync_results"] = (
+                            new_id.strip(),
+                            sync_org_to_lambdas(_lambda, new_id.strip()))
                 st.success(f"Added {new_id}. It appears on the enrollment "
                            "form within ~5 minutes (dropdown cache).")
                 st.rerun()
-            except RegistryError as exc:
-                st.error(str(exc))
 
     if active:
         col1, col2 = st.columns([3, 1])
@@ -169,11 +209,31 @@ tab_orgs, tab_cos, tab_clarity, tab_people = st.tabs(
 
 with tab_orgs:
     _registry_section("org", "organization", with_location=True)
-    st.warning(
-        "Adding an org here only feeds the enrollment dropdown. The Lambda "
-        "readers (ingestion, pullers, calibration) must also learn the new "
-        "tenant: run `python -m ops.add_org --org <id> --commit` — until "
-        "then, that org's data is silently quarantined.", icon="⚠️")
+
+    # Results of the automatic service sync from the most recent add.
+    if "org_sync_results" in st.session_state:
+        synced_org, rows = st.session_state.pop("org_sync_results")
+        st.markdown(f"**Platform services updated for `{synced_org}`:**")
+        _show_sync_results(rows, synced_org)
+
+    st.divider()
+    st.subheader("Service status")
+    st.caption(
+        "Every backend service must know an organization before it will "
+        "accept its data. Adding an org above updates them automatically — "
+        "use this to double-check, or to retry if an update failed.")
+    _active_orgs = [e["sk"] for e in list_entries(_registry, "org")]
+    if _active_orgs:
+        check_org = st.selectbox("Organization to check", _active_orgs,
+                                 key="org_status_pick")
+        col_a, col_b = st.columns(2)
+        if col_a.button("Check status"):
+            _show_sync_results(org_rollout_status(_lambda, check_org),
+                               check_org)
+        if col_b.button("Sync services"):
+            with st.spinner("Updating platform services…"):
+                _show_sync_results(sync_org_to_lambdas(_lambda, check_org),
+                                   check_org)
 
 with tab_cos:
     _registry_section("cosinuss", "Cosinuss receiver", with_location=False)
@@ -201,6 +261,29 @@ with tab_people:
           "enrolled": (p.get("enrolled_at") or p.get("created_at") or "")[:10]}
          for p in people],
         hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.subheader("Calibration")
+    st.caption(
+        "Every participant with a Fitbit gets a temperature baseline from "
+        "their first three nights of data after their enrollment date. The "
+        "platform re-checks automatically every couple of hours; use the "
+        "button to re-check right now (results appear within a few "
+        "minutes — refresh the table).")
+    if st.button("Show calibration status"):
+        st.dataframe(calibration_overview(participants, calibration),
+                     hide_index=True, use_container_width=True)
+        st.caption(
+            "**complete** = baselined · **extended/pending** = still "
+            "accumulating nights · **waiting for first sweep** = newly "
+            "(re-)registered · **no fitbit** = cannot calibrate")
+    if st.button("Run calibration check now"):
+        try:
+            trigger_calibration_sweep(_lambda)
+            st.success("Calibration check started — refresh the status "
+                       "table in a few minutes.")
+        except Exception as exc:
+            st.error(f"Could not start the check: {exc}")
 
     st.divider()
     st.subheader("Delete a participant")

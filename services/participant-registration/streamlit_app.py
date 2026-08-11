@@ -81,8 +81,15 @@ try:
         ValidationError,
         list_clarity_station_ids,
         list_cosinuss_receivers,
+        first_fitbit_data_date,
         register,
         unassigned_devices,
+    )
+    from registration_service.registry import (
+        REGISTRY_TABLE_NAME,
+        list_clarity_ids as registry_clarity_ids,
+        list_cosinuss_ids as registry_cosinuss_ids,
+        list_orgs as registry_orgs,
     )
 except ImportError as _exc:
     st.error(
@@ -152,11 +159,19 @@ SCOPES = (
     "electrocardiogram irregular_rhythm_notifications"
 )
 
-# Default/fallback org_id — the actual value used for any given
-# registration is typed into the form (Step 3), since org_id is per-tenant
-# scoping and this portal may serve more than one org over time. This is
-# just what pre-fills the field and what the OAuth step (which happens
-# before org_id is known) stamps into the token file provisionally.
+# Preselect only — the org actually used for a registration is picked from
+# the Registry-backed dropdown in Step 3 (org_id is per-tenant scoping and
+# this portal may serve more than one org). Also what the OAuth step (which
+# happens before the dropdown pick exists) stamps into the token file
+# provisionally; that stamp is overwritten with the real pick on successful
+# enrollment and read by nothing in the meantime, so a stale value here is
+# cosmetic, not a data-integrity risk.
+#
+# NB: org_id used to be a free-text field, and THAT was the actual source
+# of past org/participant mismatches — a typo or stray value silently
+# created a "shadow tenant" no Lambda reader knew about (see
+# ops/add_org.py's docstring). The dropdown below closes that; this
+# constant is now just a UI convenience, not the source of truth.
 DEFAULT_ORG_ID = conf("CBT_ORG_ID", "org1")
 AWS_REGION = conf("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
@@ -175,17 +190,17 @@ S3_BUCKET_NAME = conf("S3_BUCKET_NAME", "fitbit-study-tokens-stored")
 # Any S3_TOKEN_PREFIX value still set in Streamlit Cloud secrets is now
 # inert; delete it at your leisure.
 S3_TOKEN_PREFIX = "fitbit_tokens/"
-# The raw sensor bucket doubles as the device inventory (see module
-# docstring): folder-per-receiver for Cosinuss, and for Clarity the
-# datasourceId column read out of a recent raw CSV.
+# FALLBACK ONLY (see the Registry section below, which is the primary
+# source for both dropdowns). RAW_BUCKET/CLARITY_ID matter only if the
+# Registry table is empty or briefly unreachable — otherwise the S3
+# inference functions below are defined but never actually called.
+# Left configurable rather than deleted so the form still works during
+# first rollout, before an admin has seeded the Registry.
 RAW_BUCKET = conf("RAW_BUCKET", "raw-data-all-sensors-782329476642-us-east-1-an")
 
-# Comma-separated Clarity station ids, UNIONED with the ones derived from
-# the bucket (currently DGFVZ0274 reports there on its own). Keep it for a
-# station that is installed but not yet reporting; it is no longer the
-# only source. A site_id matching neither is rejected with a "contact the
-# research admin" message instead of silently misattributing environmental
-# data.
+# Comma-separated Clarity station ids, unioned with ones derived from the
+# bucket. FALLBACK ONLY — add new stations in the admin portal, not here;
+# this is not read once the Registry has at least one clarity entry.
 KNOWN_CLARITY_IDS = [c.strip() for c in (conf("CLARITY_ID", "") or "").split(",")
                      if c.strip()]
 
@@ -214,20 +229,19 @@ _s3 = _session.client("s3")
 
 @st.cache_data(ttl=300)
 def known_cosinuss_ids() -> list[str]:
+    """S3-inferred fallback — only called by cosinuss_id_options() below
+    when the Registry has no cosinuss entries yet."""
     return list_cosinuss_receivers(_s3, RAW_BUCKET)
 
 
 @st.cache_data(ttl=300)
 def known_clarity_ids() -> list[str]:
-    """Clarity stations actually reporting into the raw bucket, unioned
-    with any configured in CLARITY_ID.
+    """S3-inferred fallback — only called by clarity_id_options() below
+    when the Registry has no clarity entries yet.
 
     Clarity ids are NOT derivable from prefixes — the station id is the
     `datasourceId` column inside clarity/raw/<date>/<timestamp>.csv — so
-    this reads a recent file rather than listing folders. The env var
-    stays as a supplement for a station that is installed but not yet
-    reporting; it is no longer the only source, which is what forced the
-    old "type it and hope" free-text field.
+    this reads a recent file rather than listing folders.
     """
     derived = []
     try:
@@ -235,6 +249,41 @@ def known_clarity_ids() -> list[str]:
     except Exception:
         pass
     return sorted(set(derived) | set(KNOWN_CLARITY_IDS))
+
+
+# ---------------------------------------------------------------------------
+# Admin-managed Registry (preferred source for every dropdown). The admin
+# portal (services/admin-portal) curates these lists; the S3-derived
+# inventories above remain only as a fallback while the Registry is empty
+# (e.g. during first rollout), so the form is never bricked.
+# ---------------------------------------------------------------------------
+_registry_table = _dynamodb.Table(REGISTRY_TABLE_NAME)
+
+
+@st.cache_data(ttl=300)
+def registry_org_options() -> list[dict]:
+    try:
+        return registry_orgs(_registry_table)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def cosinuss_id_options() -> list[str]:
+    try:
+        ids = registry_cosinuss_ids(_registry_table)
+    except Exception:
+        ids = []
+    return ids or known_cosinuss_ids()
+
+
+@st.cache_data(ttl=300)
+def clarity_id_options() -> list[str]:
+    try:
+        ids = registry_clarity_ids(_registry_table)
+    except Exception:
+        ids = []
+    return ids or known_clarity_ids()
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +438,19 @@ if "fitbit" not in st.session_state:
     token_payload["participant_id"] = None
     token_payload["org_id"] = DEFAULT_ORG_ID
 
+    # Capture the previous token file's timestamp BEFORE overwriting it —
+    # for a returning participant it records an earlier authorization of
+    # this same account, and enrollment is backdated to the earliest
+    # evidence of the account (see the submit handler). Best-effort.
+    prior_token_at = None
+    try:
+        head = _s3.head_object(Bucket=S3_BUCKET_NAME,
+                               Key=f"{S3_TOKEN_PREFIX}{encoded_id}.json")
+        prior_token_at = head["LastModified"].astimezone(
+            datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        pass  # first-ever authorization — no prior file
+
     try:
         _s3.put_object(
             Bucket=S3_BUCKET_NAME, Key=f"{S3_TOKEN_PREFIX}{encoded_id}.json",
@@ -403,6 +465,7 @@ if "fitbit" not in st.session_state:
     st.session_state["fitbit"] = {
         "encoded_id": encoded_id,
         "token_payload": token_payload,
+        "prior_token_at": prior_token_at,
     }
     # fall through to the form below on this same run
 
@@ -440,11 +503,29 @@ st.markdown("<div class='subheader'>Step 2 — Participant enrollment</div>",
 # don't trigger a rerun until submit — so both need to be normal widgets
 # to keep the Cosinuss pool (and, on submit, the registration itself)
 # scoped to the org actually typed in.
-org_id_input = st.text_input(
-    "Organization ID", value=DEFAULT_ORG_ID,
-    help="Tenant scope for this registration. Leave the default unless "
-         "you know this study spans multiple orgs.",
-).strip() or DEFAULT_ORG_ID
+# Org comes from the admin-managed Registry (name + location shown so a
+# participant picks the site they actually work at). Free text only as a
+# fallback while the Registry has no orgs yet.
+_org_options = registry_org_options()
+if _org_options:
+    _org_labels = {
+        f"{o.get('name') or o['org_id']}"
+        + (f" — {o['location']}" if o.get("location") else "")
+        + f" ({o['org_id']})": o["org_id"]
+        for o in _org_options
+    }
+    _default_idx = next(
+        (i for i, v in enumerate(_org_labels.values()) if v == DEFAULT_ORG_ID), 0)
+    org_id_input = _org_labels[st.selectbox(
+        "Organization", list(_org_labels), index=_default_idx,
+        help="Your organization / study site. Ask the research admin if "
+             "you are unsure.")]
+else:
+    org_id_input = st.text_input(
+        "Organization ID", value=DEFAULT_ORG_ID,
+        help="Tenant scope for this registration. Leave the default unless "
+             "you know this study spans multiple orgs.",
+    ).strip() or DEFAULT_ORG_ID
 
 participants = ScopedTable(_dynamodb.Table("Participants"), org_id_input)
 devices = ScopedTable(_dynamodb.Table("DeviceAssignments"), org_id_input)
@@ -457,11 +538,9 @@ mode = st.radio("Enrollment mode", ["production", "research"], horizontal=True)
 # no chance of attributing the participant to the wrong Fitbit.
 fitbit_id = encoded_id
 
-# Cosinuss pool derived from the raw bucket (5-min cache, folder-per-device
-# layout). NB: widgets inside st.form don't re-render until submit, so the
-# "Other" text input below is always visible instead of appearing
-# conditionally.
-cosinuss_pool = unassigned_devices(devices, "cosinuss", known_cosinuss_ids())
+# Cosinuss pool: admin-managed Registry ids (S3-derived fallback while the
+# Registry is empty), minus devices currently worn by someone in this org.
+cosinuss_pool = unassigned_devices(devices, "cosinuss", cosinuss_id_options())
 
 with st.form("enroll"):
     st.text_input("Fitbit ID (from the connected account)", value=fitbit_id,
@@ -484,28 +563,25 @@ with st.form("enroll"):
     # out of the datasourceId column — Clarity has no per-device folder to
     # list), with a free-text fallback for a unit that is installed but
     # hasn't reported yet.
-    clarity_pool = known_clarity_ids()
+    clarity_pool = clarity_id_options()
     site_pick = st.selectbox(
         "Clarity device ID (work site's environmental sensor)",
-        clarity_pool + [OTHER_OPTION],
-        help="Stations currently reporting data for this study. Pick the "
-             "unit covering this participant's work site — ask the site "
-             "organizer if unsure, do not guess.",
+        clarity_pool,
+        help="Stations registered for this study. Pick the unit covering "
+             "this participant's work site — ask the site organizer if "
+             "unsure, do not guess. A missing station must be added by the "
+             "research admin (admin portal).",
     ) if clarity_pool else None
-    site_other = st.text_input(
-        "If the Clarity station isn't listed, type its ID here",
-        help="Its datasourceid, e.g. DGFVZ0274.",
-    )
+    site_other = ""
 
     cosinuss_pick = cosinuss_other = None
     if mode == "research":
         cosinuss_pick = st.selectbox(
             "Cosinuss in-ear sensor (devices not currently worn by anyone)",
-            cosinuss_pool + [OTHER_OPTION],
-        )
-        cosinuss_other = st.text_input(
-            "If the Cosinuss sensor isn't listed, type its ID here",
-        )
+            cosinuss_pool,
+            help="A missing sensor must be added by the research admin "
+                 "(admin portal).",
+        ) if cosinuss_pool else None
 
     consent = st.checkbox("Participant has given informed consent")
     submitted = st.form_submit_button("Enroll")
@@ -523,9 +599,11 @@ def _resolve_pick(pick, other):
 if submitted:
     site_id = _resolve_pick(site_pick, site_other).strip()
     if not site_id:
-        st.error("A Clarity station is required — pick one or type its ID.")
+        st.error("A Clarity station is required — pick one from the list. "
+                 "If none are listed, ask the research admin to add the "
+                 "station in the admin portal.")
         st.stop()
-    known_stations = known_clarity_ids()
+    known_stations = clarity_id_options()
     if known_stations and site_id not in known_stations:
         st.error(
             f"'{site_id}' isn't a recognized Clarity station for this study "
@@ -535,6 +613,28 @@ if submitted:
         )
         st.stop()
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
+
+    # BACKDATE enrollment to when this Fitbit account actually joined the
+    # study, not the moment this form was submitted. After the ledger wipe,
+    # everyone re-registers — but their raw data (append-only, survived the
+    # wipe) and calibration windows must anchor to the original sign-up.
+    # Earliest evidence wins: first raw-data day under
+    # fitbit/raw/<fitbit_id>/, or the previous token file's timestamp
+    # (captured before this session overwrote it). Genuinely new
+    # participants have neither and enroll as of now.
+    now_iso = (datetime.datetime.now(datetime.timezone.utc)
+               .isoformat().replace("+00:00", "Z"))
+    candidates = [now_iso]
+    try:
+        first_data = first_fitbit_data_date(_s3, RAW_BUCKET, fitbit_id)
+        if first_data:
+            candidates.append(first_data)
+    except Exception:
+        pass  # backdating is best-effort; never block an enrollment on it
+    if fitbit.get("prior_token_at"):
+        candidates.append(fitbit["prior_token_at"])
+    effective_from = min(candidates)
+
     req = RegistrationRequest(
         user_id=(user_id or "").strip(), email=(email or "").strip(),
         display_name=(display_name or "").strip(), sex=sex, age=int(age),
@@ -542,8 +642,7 @@ if submitted:
         weight_lbs=weight_lbs, race=race, enrollment_mode=mode,
         consent_given=consent, site_id=site_id, fitbit_id=fitbit_id,
         cosinuss_id=cosinuss_id,
-        effective_from=datetime.datetime.now(datetime.timezone.utc)
-        .isoformat().replace("+00:00", "Z"),
+        effective_from=effective_from,
     )
     try:
         result = register(_client, participants, devices, sites, req)
@@ -586,6 +685,14 @@ if submitted:
             if DEBUG_MODE:
                 st.write("linkage write failed:", str(e))
 
+        if effective_from != now_iso:
+            st.info(
+                f"Enrollment date recorded as **{effective_from[:10]}** — "
+                "this Fitbit account was already part of the study, so the "
+                "original sign-up date is kept (device history and "
+                "calibration anchor to it).",
+                icon="📅",
+            )
         if result.created_new_participant:
             st.success(f"Enrolled new participant {result.participant_id}")
         else:
