@@ -18,9 +18,67 @@ from assignment_ledger.queries import (
 from assignment_ledger.writes import HEAD_SK
 from cbt_shared.tenancy import ScopedTable
 
+# The table of Lambdas that must know the full tenant list lives in
+# ops/add_org.py (spec of record — the CLI and this portal must agree).
+from ops.add_org import ORG_AWARE_FUNCTIONS, current_orgs
+
 
 class ParticipantNotFoundError(KeyError):
     pass
+
+
+def org_rollout_status(lambda_client, org_id: str) -> list[dict]:
+    """Which Lambdas already know this org. One row per function:
+    {function, status: known|missing|not_deployed, orgs}."""
+    rows = []
+    for fn, orgs in current_orgs(lambda_client).items():
+        if orgs is None:
+            status = "not_deployed"
+        elif org_id in orgs:
+            status = "known"
+        else:
+            status = "missing"
+        rows.append({"function": fn, "status": status, "orgs": orgs or []})
+    return rows
+
+
+def sync_org_to_lambdas(lambda_client, org_id: str) -> list[dict]:
+    """Append org_id to every org-aware Lambda's tenant list (the same
+    merge `python -m ops.add_org --org <id> --commit` performs, so admins
+    never need a terminal). Idempotent; never removes an org. One row per
+    function: {function, status: added|already|not_deployed|error, detail}.
+    """
+    results = []
+    for fn, var in ORG_AWARE_FUNCTIONS.items():
+        try:
+            env = lambda_client.get_function_configuration(
+                FunctionName=fn).get("Environment", {}).get("Variables", {})
+        except Exception as exc:
+            # boto3 raises ClientError whose str() carries the error code.
+            if "ResourceNotFound" in f"{type(exc).__name__} {exc}":
+                results.append({"function": fn, "status": "not_deployed",
+                                "detail": ""})
+            else:
+                results.append({"function": fn, "status": "error",
+                                "detail": str(exc)})
+            continue
+        raw = env.get(var) or env.get("CBT_ORG_ID") or ""
+        orgs = [o.strip() for o in raw.split(",") if o.strip()]
+        if org_id in orgs:
+            results.append({"function": fn, "status": "already",
+                            "detail": ",".join(orgs)})
+            continue
+        env[var] = ",".join(orgs + [org_id])
+        try:
+            lambda_client.update_function_configuration(
+                FunctionName=fn, Environment={"Variables": env})
+            lambda_client.get_waiter("function_updated").wait(FunctionName=fn)
+            results.append({"function": fn, "status": "added",
+                            "detail": env[var]})
+        except Exception as exc:
+            results.append({"function": fn, "status": "error",
+                            "detail": str(exc)})
+    return results
 
 
 def list_participants(participants: ScopedTable) -> list[dict]:
