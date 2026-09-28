@@ -56,3 +56,17 @@ def test_unknown_kind_raises(registry):
 def test_empty_id_raises(registry):
     with pytest.raises(RegistryError):
         add_entry(registry, "org", "   ")
+
+
+def test_clarity_org_map(registry):
+    from registration_service.registry import add_entry, clarity_org_map, deactivate_entry
+
+    add_entry(registry, "clarity", "DGFVZ0274", org_id="org1")
+    add_entry(registry, "clarity", "DIAFM3720", org_id="org2")
+    add_entry(registry, "clarity", "NOORG1234")  # no org assigned
+
+    assert clarity_org_map(registry) == {
+        "DGFVZ0274": "org1", "DIAFM3720": "org2"}
+
+    deactivate_entry(registry, "clarity", "DGFVZ0274")
+    assert clarity_org_map(registry) == {"DIAFM3720": "org2"}

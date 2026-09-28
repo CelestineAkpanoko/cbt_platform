@@ -70,6 +70,15 @@ def list_clarity_ids(table) -> list[str]:
     return [i["sk"] for i in list_entries(table, "clarity")]
 
 
+def clarity_org_map(table) -> dict:
+    """station_id -> org_id for every active clarity entry that has an
+    org assigned. This is what routes a station's data to its tenant —
+    the clarity puller and the historical restructure script both use it,
+    so the admin portal is the single place the mapping is managed."""
+    return {i["sk"]: i["org_id"] for i in list_entries(table, "clarity")
+            if i.get("org_id")}
+
+
 def add_entry(
     table,
     kind: str,
@@ -77,6 +86,7 @@ def add_entry(
     *,
     name: str = "",
     location: str = "",
+    org_id: str = "",
     created_by: str = "",
 ) -> dict:
     """Add a new entry, or reactivate (and update) a deactivated one.
@@ -95,6 +105,8 @@ def add_entry(
         "active": True,
         "created_at": _now(),
     }
+    if org_id:
+        item["org_id"] = org_id.strip()
     if created_by:
         item["created_by"] = created_by
     try:

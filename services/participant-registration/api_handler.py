@@ -16,7 +16,16 @@ from registration_service import (
     register,
 )
 
-ORG_ID = os.environ.get("CBT_ORG_ID", "org1")
+# Default tenant. A request may name a different one via "org_id" in the
+# body, which is what makes a second site with its own tenant workable
+# without a second deployment of this Lambda — the Streamlit form already
+# carries org_id as a field for exactly this reason.
+DEFAULT_ORG_ID = os.environ.get("CBT_ORG_ID", "org1")
+# Allow-list. Without it, a typo'd or hostile org_id would silently create
+# a whole shadow tenant that no reader is configured to look at: the data
+# would land, resolve to nothing, and quarantine forever.
+ALLOWED_ORG_IDS = {o.strip() for o in os.environ.get(
+    "CBT_ORG_IDS", DEFAULT_ORG_ID).split(",") if o.strip()}
 
 _dynamodb = boto3.resource("dynamodb")
 _client = boto3.client("dynamodb")
@@ -24,13 +33,20 @@ _client = boto3.client("dynamodb")
 
 def lambda_handler(event, _context):
     body = json.loads(event.get("body") or "{}")
+    org_id = (body.pop("org_id", None) or DEFAULT_ORG_ID).strip()
+    if org_id not in ALLOWED_ORG_IDS:
+        return {"statusCode": 400, "body": json.dumps({
+            "error": f"unknown org_id {org_id!r}. Known: "
+                     f"{sorted(ALLOWED_ORG_IDS)}. Add it to CBT_ORG_IDS on "
+                     f"this function and on the readers (ingestion-resolver, "
+                     f"cosinuss-pull-to-s3) before enrolling into it."})}
     try:
         req = RegistrationRequest(**body)
         result = register(
             _client,
-            ScopedTable(_dynamodb.Table("Participants"), ORG_ID),
-            ScopedTable(_dynamodb.Table("DeviceAssignments"), ORG_ID),
-            ScopedTable(_dynamodb.Table("SiteAssignments"), ORG_ID),
+            ScopedTable(_dynamodb.Table("Participants"), org_id),
+            ScopedTable(_dynamodb.Table("DeviceAssignments"), org_id),
+            ScopedTable(_dynamodb.Table("SiteAssignments"), org_id),
             req,
         )
     except (TypeError, ValidationError) as e:

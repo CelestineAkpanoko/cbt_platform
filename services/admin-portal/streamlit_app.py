@@ -21,6 +21,7 @@ Required: ADMIN_PASSWORD. Optional: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
 (else ambient creds), AWS_REGION.
 """
 
+import datetime
 import hmac
 import os
 import sys
@@ -38,6 +39,7 @@ import streamlit as st
 
 try:
     from cbt_shared.tenancy import ScopedTable
+    from assignment_ledger.writes import DeviceJustReassignedError
     from registration_service.registry import (
         REGISTRY_TABLE_NAME,
         RegistryError,
@@ -48,11 +50,13 @@ try:
     from admin_service import (
         ParticipantNotFoundError,
         calibration_overview,
+        current_assignments,
         delete_participant,
         list_participants,
         org_rollout_status,
         sync_org_to_lambdas,
         trigger_calibration_sweep,
+        unassign_participant,
     )
 except ImportError as _exc:
     st.error(
@@ -106,6 +110,7 @@ if _ak and _sk:
 else:
     _session = boto3.Session(region_name=AWS_REGION)
 _dynamodb = _session.resource("dynamodb")
+_dynamo_client = _session.client("dynamodb")
 _lambda = _session.client("lambda")
 _registry = _dynamodb.Table(REGISTRY_TABLE_NAME)
 
@@ -143,18 +148,21 @@ def _scoped_tables(org_id: str):
     )
 
 
-def _registry_section(kind: str, label: str, *, with_location: bool):
+def _registry_section(kind: str, label: str, *, with_location: bool,
+                      with_org: bool = False):
     """Shared list/add/deactivate UI for one registry kind."""
     entries = list_entries(_registry, kind, include_inactive=True)
     active = [e for e in entries if e.get("active", True)]
     inactive = [e for e in entries if not e.get("active", True)]
 
     if active:
-        st.dataframe(
-            [{"id": e["sk"], "name": e.get("name", ""),
-              "location": e.get("location", ""),
-              "added": (e.get("created_at") or "")[:10]} for e in active],
-            hide_index=True, use_container_width=True)
+        rows = [{"id": e["sk"], "name": e.get("name", ""),
+                 "location": e.get("location", ""),
+                 "added": (e.get("created_at") or "")[:10]} for e in active]
+        if with_org:
+            for row, e in zip(rows, active):
+                row["organization"] = e.get("org_id", "⚠️ none")
+        st.dataframe(rows, hide_index=True, use_container_width=True)
     else:
         st.info(f"No active {label} yet — add the first one below.")
 
@@ -164,10 +172,23 @@ def _registry_section(kind: str, label: str, *, with_location: bool):
         new_name = st.text_input("Name", key=f"{kind}_name")
         new_loc = (st.text_input("Location", key=f"{kind}_loc")
                    if with_location else "")
+        new_org = ""
+        if with_org:
+            org_choices = [e["sk"] for e in list_entries(_registry, "org")]
+            new_org = st.selectbox(
+                "Organization this station belongs to", org_choices,
+                index=None, key=f"{kind}_org",
+                help="Routes this station's environmental data to the "
+                     "right organization — required so data and "
+                     "predictions never mix across organizations.")
         if st.form_submit_button("Add"):
+            if with_org and not new_org:
+                st.error("Pick the organization this station belongs to.")
+                st.stop()
             try:
                 add_entry(_registry, kind, new_id, name=new_name,
-                          location=new_loc, created_by="admin-portal")
+                          location=new_loc, org_id=new_org or "",
+                          created_by="admin-portal")
             except RegistryError as exc:
                 st.error(str(exc))
             else:
@@ -239,7 +260,15 @@ with tab_cos:
     _registry_section("cosinuss", "Cosinuss receiver", with_location=False)
 
 with tab_clarity:
-    _registry_section("clarity", "Clarity station", with_location=True)
+    _registry_section("clarity", "Clarity station", with_location=True,
+                      with_org=True)
+    st.caption(
+        "A station's organization decides where its data files go "
+        "(clarity/raw/<org>/<station>/…) and which participants' "
+        "predictions may use it. A station with no organization is "
+        "collected under _unassigned and used by nobody — fix it by "
+        "deactivating and re-adding the station with the right "
+        "organization.")
 
 with tab_people:
     orgs = [e["sk"] for e in list_entries(_registry, "org")]
@@ -285,11 +314,60 @@ with tab_people:
         except Exception as exc:
             st.error(f"Could not start the check: {exc}")
 
-    st.divider()
-    st.subheader("Delete a participant")
     by_pid = {f"{p.get('user_id') or '?'} ({p['participant_id']})": p
               for p in people}
-    choice = st.selectbox("Participant", list(by_pid), index=None)
+
+    st.divider()
+    st.subheader("Unassign a participant (leaving the study)")
+    st.caption(
+        "Ends this participant's current Cosinuss receiver and Clarity "
+        "station coverage as of the date below. Their profile, calibration "
+        "history, and identity markers are left untouched, so they can be "
+        "re-linked later if they return. The receiver becomes selectable "
+        "again on the enrollment form immediately. Use this — not delete — "
+        "for someone who finished data collection but should stay on file.")
+    unassign_choice = st.selectbox("Participant", list(by_pid), index=None,
+                                   key="unassign_pick")
+    if unassign_choice:
+        u_person = by_pid[unassign_choice]
+        u_pid = u_person["participant_id"]
+        held = current_assignments(devices, sites, u_pid)
+        if not held["devices"] and not held["site"]:
+            st.info("Nothing currently assigned to this participant.")
+        else:
+            held_desc = [f"{d['device_type']} `{d['device_id']}`"
+                        for d in held["devices"]]
+            if held["site"]:
+                held_desc.append(f"clarity site `{held['site']}`")
+            st.write("Currently holds: " + ", ".join(held_desc))
+            end_date = st.date_input("Coverage ends", value=datetime.date.today(),
+                                     key="unassign_date")
+            if st.button("Unassign", key="unassign_btn"):
+                effective_to = datetime.datetime.combine(
+                    end_date, datetime.time.min, tzinfo=datetime.timezone.utc
+                ).isoformat().replace("+00:00", "Z")
+                try:
+                    result = unassign_participant(
+                        _dynamo_client, participants, devices, sites,
+                        u_pid, effective_to)
+                except DeviceJustReassignedError as exc:
+                    st.error(f"State changed since this page loaded: {exc} "
+                             "Refresh and try again.")
+                except ParticipantNotFoundError:
+                    st.warning("Already deleted.")
+                else:
+                    freed = ", ".join(
+                        f"{d['device_type']} {d['device_id']}"
+                        for d in result["devices"]) or "no devices"
+                    site_note = (f"; ended site {result['site']} coverage"
+                                if result["site"] else "")
+                    st.success(f"Unassigned. Freed: {freed}{site_note}.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Delete a participant")
+    choice = st.selectbox("Participant", list(by_pid), index=None,
+                          key="delete_pick")
     if choice:
         person = by_pid[choice]
         pid = person["participant_id"]

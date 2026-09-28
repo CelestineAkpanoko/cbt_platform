@@ -189,3 +189,14 @@ def test_first_fitbit_data_date_none_for_unknown_account(s3):
     from registration_service import first_fitbit_data_date
 
     assert first_fitbit_data_date(s3, RAW_BUCKET, "NEVERSEEN") is None
+
+
+def test_other_archive_yields_receivers_not_users(s3):
+    """OTHER/<receiver>/ holds real receivers under a non-user parent."""
+    from registration_service import list_cosinuss_receivers
+
+    _land(s3, "cosinuss/raw/OTHER/ZC5C5W/2026-05-01_00-00-00_UTC_x.csv")
+    _land(s3, "cosinuss/raw/user15/FKCWHM/2026-08-01_00-00-00_UTC_x.csv")
+    receivers = list_cosinuss_receivers(s3, RAW_BUCKET)
+    assert "ZC5C5W" in receivers and "FKCWHM" in receivers
+    assert "OTHER" not in receivers and "user15" not in receivers

@@ -29,7 +29,10 @@ from botocore.exceptions import ClientError
 from cbt_shared.models import DeviceAssignment, SiteAssignment
 from cbt_shared.tenancy import ScopedTable
 
-from .queries import current_device_assignment, current_site_assignment
+from .queries import (
+    current_device_assignment,
+    current_site_assignment,
+)
 
 HEAD_SK = "#HEAD"
 
@@ -98,6 +101,107 @@ def _transact_reassign(client, table_name: str, pk: str,
                 "this device was just reassigned, refresh and retry"
             ) from e
         raise
+
+
+def _transact_release(client, table_name: str, pk: str,
+                      current_item: dict, effective_to: str, token: str):
+    """Close the open window on `pk` without opening a replacement.
+
+    Same two of _transact_reassign's three actions (close the current row,
+    clear the HEAD mutex) with the Put dropped — there is no new wearer.
+    Clearing HEAD's current_from (rather than leaving it stale) is what
+    lets a later assign_*() see the device/site as free again, via the
+    same attribute_not_exists(current_from) condition used for a device
+    that was never assigned at all.
+    """
+    actions = [
+        {
+            "Update": {
+                "TableName": table_name,
+                "Key": _s({"pk": pk, "sk": HEAD_SK}),
+                "UpdateExpression": "REMOVE current_from",
+                "ConditionExpression": "current_from = :expected",
+                "ExpressionAttributeValues": _s(
+                    {":expected": current_item["effective_from"]}),
+            }
+        },
+        {
+            "Update": {
+                "TableName": table_name,
+                "Key": _s({"pk": current_item["pk"], "sk": current_item["sk"]}),
+                "UpdateExpression": "SET effective_to = :to REMOVE is_current",
+                "ConditionExpression": "attribute_exists(is_current)",
+                "ExpressionAttributeValues": _s({":to": effective_to}),
+            }
+        },
+    ]
+    try:
+        client.transact_write_items(TransactItems=actions, ClientRequestToken=token)
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("TransactionCanceledException", "ConditionalCheckFailedException"):
+            raise DeviceJustReassignedError(
+                "this window changed since it was read, refresh and retry"
+            ) from e
+        raise
+
+
+def release_device(client, device_table: ScopedTable, *, device_type: str,
+                   device_id: str, effective_to: str,
+                   expected_current=_READ_NOW) -> Optional[DeviceAssignment]:
+    """Close a device's open window without handing it to anyone new.
+
+    This is the "participant left the study" operation: the device goes
+    back into unassigned_devices()'s free pool for the next enrollment,
+    while the departing participant's profile, calibration history, and
+    identity markers are left completely untouched (unlike
+    admin_service.delete_participant, which erases the whole person).
+
+    Idempotent: returns None if the device already had no current wearer.
+    expected_current follows the same optimistic-concurrency contract as
+    assign_device — pass the row the caller last observed (e.g. what the
+    admin portal rendered), or omit it to read fresh at write time.
+    """
+    if expected_current is _READ_NOW:
+        current = current_device_assignment(device_table, device_type, device_id)
+    else:
+        current = expected_current
+    if current is None:
+        return None
+    token = _request_token("release", current["pk"], current["effective_from"],
+                           effective_to)
+    _transact_release(client, device_table.name, current["pk"], current,
+                      effective_to, token)
+    return DeviceAssignment(
+        org_id=device_table.org_id, device_type=device_type, device_id=device_id,
+        participant_id=current["participant_id"], role=current["role"],
+        effective_from=current["effective_from"], effective_to=effective_to,
+    )
+
+
+def release_site(client, site_table: ScopedTable, *, entity_kind: str,
+                 entity_id: str, effective_to: str,
+                 expected_current=_READ_NOW) -> Optional[SiteAssignment]:
+    """Close a participant's open site window without opening a replacement.
+    See release_device for the participant-offboarding use case; the
+    difference is that a site is shared, so nothing is "freed" for anyone
+    else — this only ends the departing participant's own coverage window.
+    """
+    if expected_current is _READ_NOW:
+        current = current_site_assignment(site_table, entity_kind, entity_id)
+    else:
+        current = expected_current
+    if current is None:
+        return None
+    token = _request_token("release", current["pk"], current["effective_from"],
+                           effective_to)
+    _transact_release(client, site_table.name, current["pk"], current,
+                      effective_to, token)
+    return SiteAssignment(
+        org_id=site_table.org_id, entity_kind=entity_kind, entity_id=entity_id,
+        site_id=current["site_id"], effective_from=current["effective_from"],
+        effective_to=effective_to,
+    )
 
 
 def assign_device(client, device_table: ScopedTable, *, device_type: str,

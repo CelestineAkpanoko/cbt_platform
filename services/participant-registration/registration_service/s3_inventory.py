@@ -47,7 +47,7 @@ COSINUSS_STATE_KEY = "cosinuss/state/cosinuss_state.json"
 # Reserved first-path-segments under cosinuss/raw/ that are not user ids.
 # The puller routes sessions it cannot attribute here (see the cosinuss
 # puller's UNASSIGNED_USER); they must never surface as a participant.
-_RESERVED_SEGMENTS = {"_unassigned", "_unknown"}
+_RESERVED_SEGMENTS = {"_unassigned", "_unknown", "OTHER"}
 
 
 def _common_prefixes(s3_client, bucket: str, prefix: str) -> list[str]:

@@ -239,6 +239,15 @@ class CalibrationRecord:
     calibration_status: str  # pending | complete | extended
     provisional: bool
     consent_status: str = "consented"  # see Participant.consent_status note
+    # Baseline provenance (algorithm v2). A baseline closed at the deadline
+    # on two nights is a different thing from one built on three, and the
+    # difference has to survive into the record — otherwise nobody reading
+    # a resting_hr later can tell how much to trust it.
+    nights_used: Optional[int] = None
+    nights_required: Optional[int] = None
+    night_dates: Optional[list] = None
+    night_window: Optional[str] = None
+    closed_by_deadline: Optional[bool] = None
 
     def pk(self) -> str:
         return f"{self.org_id}#{self.participant_id}"

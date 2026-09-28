@@ -14,8 +14,14 @@ from boto3.dynamodb.conditions import Attr
 from assignment_ledger.queries import (
     all_participants,
     assignments_for_participant,
+    current_site_assignment,
 )
-from assignment_ledger.writes import HEAD_SK
+from assignment_ledger.writes import (
+    HEAD_SK,
+    DeviceJustReassignedError,
+    release_device,
+    release_site,
+)
 from cbt_shared.tenancy import ScopedTable
 
 # The table of Lambdas that must know the full tenant list. Lives in
@@ -135,6 +141,81 @@ def trigger_calibration_sweep(lambda_client) -> dict:
     resp = lambda_client.invoke(FunctionName=CALIBRATION_SWEEP_FUNCTION,
                                 InvocationType="Event")
     return {"status_code": resp.get("StatusCode")}
+
+
+def _current_device_rows(devices: ScopedTable, participant_id: str) -> list[dict]:
+    return [row for row in assignments_for_participant(devices, participant_id)
+            if "is_current" in row]
+
+
+def current_assignments(devices: ScopedTable, sites: ScopedTable,
+                        participant_id: str) -> dict:
+    """What this participant currently holds — the admin portal shows this
+    before unassigning them, so "unassign" never surprises anyone with what
+    it's about to close. Same rows unassign_participant() would act on.
+
+    Returns {"devices": [{"device_type", "device_id"}, ...], "site": str|None}.
+    """
+    site_row = current_site_assignment(sites, "participant", participant_id)
+    return {
+        "devices": [{"device_type": r["device_type"], "device_id": r["device_id"]}
+                    for r in _current_device_rows(devices, participant_id)],
+        "site": site_row["site_id"] if site_row else None,
+    }
+
+
+def unassign_participant(
+    dynamo_client,
+    participants: ScopedTable,
+    devices: ScopedTable,
+    sites: ScopedTable,
+    participant_id: str,
+    effective_to: str,
+) -> dict:
+    """End a participant's study coverage without deleting their profile.
+
+    The "no longer in the study" operation: closes whatever exclusive-wear
+    device window (cosinuss) and Clarity site window are currently open for
+    this participant, at `effective_to`. The device goes back into
+    unassigned_devices()'s free pool for the next participant to pick up
+    immediately — the departing participant's profile, calibration
+    history, and identity markers are all left intact, so they can be
+    re-linked later if they return to the study (unlike delete_participant,
+    which erases the whole person and frees their identity for reuse).
+
+    Idempotent: a participant with nothing currently open returns empty
+    results rather than erroring. Raises DeviceJustReassignedError (from
+    assignment_ledger) if the device/site changed between the portal
+    rendering its state and this call — same "refresh and retry" contract
+    as assign_device.
+
+    Returns {"devices": [{"device_type", "device_id"}, ...], "site": str|None}
+    describing what was actually closed.
+    """
+    if not participants.get_item("pk", participants.scoped(participant_id)):
+        raise ParticipantNotFoundError(participant_id)
+
+    released_devices = []
+    for row in _current_device_rows(devices, participant_id):
+        release_device(
+            dynamo_client, devices, device_type=row["device_type"],
+            device_id=row["device_id"], effective_to=effective_to,
+            expected_current=row,
+        )
+        released_devices.append({"device_type": row["device_type"],
+                                 "device_id": row["device_id"]})
+
+    released_site = None
+    current_site = current_site_assignment(sites, "participant", participant_id)
+    if current_site is not None:
+        release_site(
+            dynamo_client, sites, entity_kind="participant",
+            entity_id=participant_id, effective_to=effective_to,
+            expected_current=current_site,
+        )
+        released_site = current_site["site_id"]
+
+    return {"devices": released_devices, "site": released_site}
 
 
 def delete_participant(
