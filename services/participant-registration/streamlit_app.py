@@ -481,9 +481,13 @@ if (_google_configured and auth_code and returned_state
     # already-consumed (single-use) Google authorization code — same
     # reasoning as the Fitbit "Connect a different device" handler below.
     st.query_params.clear()
-    # Deliberately NOT st.stop() here on the success path: execution falls
-    # through to the existing Fitbit session_state (already present) and
-    # renders Step 3 normally below, now showing the Google-connected state.
+    # If session survived the redirect, fall through to render the full page
+    # with the google_connected badge. If session was lost (common on
+    # Streamlit Cloud), stop here — the success/error message above is the
+    # confirmation; continuing would hand the Google auth code to the Fitbit
+    # token exchange block below, which rejects it with a verifier error.
+    if "fitbit" not in st.session_state:
+        st.stop()
 
 if "fitbit" not in st.session_state:
     if not auth_code:
