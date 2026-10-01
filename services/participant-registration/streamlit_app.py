@@ -387,17 +387,32 @@ returned_state = _first(params.get("state"))
 # apart. ---
 if (_google_configured and auth_code and returned_state
        and returned_state.startswith(GOOGLE_STATE_PREFIX)):
-    fitbit_ctx = st.session_state.get("fitbit")
-    if not fitbit_ctx or not fitbit_ctx.get("enrolled"):
-        # Session was lost (new tab, server restart, etc.) between clicking
-        # "Connect with Google" and Google's redirect back. Without an
-        # established fitbit_id there is nothing safe to attach these
-        # tokens to — fail loudly rather than guess.
+    # Parse fitbit_id from state — format "ghoauth:<fitbit_id>:<nonce>".
+    # This survives session loss: we embedded the fitbit_id at click time
+    # so the callback never needs session_state to know who this belongs to.
+    _state_parts = returned_state[len(GOOGLE_STATE_PREFIX):].split(":", 1)
+    _g_fitbit_id = _state_parts[0] if _state_parts else ""
+    if not _g_fitbit_id:
+        st.error("The Google connection could not be linked to an enrollment "
+                 "(malformed state). Please start the enrollment flow again.")
+        st.stop()
+
+    # Verify this fitbit_id actually has an enrolled Fitbit token in S3 —
+    # proves the account completed Step 2 before clicking Connect with Google,
+    # without relying on session_state at all.
+    _fitbit_token_data = {}
+    try:
+        _obj = _s3.get_object(Bucket=S3_BUCKET_NAME,
+                              Key=f"{S3_TOKEN_PREFIX}{_g_fitbit_id}.json")
+        _fitbit_token_data = json.loads(_obj["Body"].read())
+    except Exception:
+        pass
+    if not _fitbit_token_data:
         st.error(
-            "Your session was lost before this Google connection could be "
-            "linked to your enrollment. Please reopen the enrollment link, "
-            "reconnect Fitbit and confirm your enrollment, then retry "
-            "connecting Google from Step 3."
+            "We could not verify your enrollment before saving the Google "
+            "connection. Please reopen the enrollment link, reconnect Fitbit "
+            "and confirm your enrollment, then retry connecting Google from "
+            "Step 3."
         )
         st.stop()
 
@@ -439,16 +454,16 @@ if (_google_configured and auth_code and returned_state
                     datetime.datetime.now(datetime.timezone.utc).timestamp()
                     + gtokens.get("expires_in", 3600)
                 ),
-                # Linkage back to the already-proven identity — never
+                # Linkage back to the proven fitbit_id from state — never
                 # derived from anything Google told us.
-                "fitbit_id": fitbit_ctx["encoded_id"],
-                "participant_id": fitbit_ctx.get("participant_id"),
-                "org_id": fitbit_ctx.get("org_id"),
+                "fitbit_id": _g_fitbit_id,
+                "participant_id": _fitbit_token_data.get("participant_id"),
+                "org_id": _fitbit_token_data.get("org_id"),
             }
             try:
                 _s3.put_object(
                     Bucket=S3_BUCKET_NAME,
-                    Key=f"{GOOGLE_TOKEN_PREFIX}{fitbit_ctx['encoded_id']}.json",
+                    Key=f"{GOOGLE_TOKEN_PREFIX}{_g_fitbit_id}.json",
                     Body=json.dumps(google_payload),
                     ContentType="application/json",
                 )
@@ -458,7 +473,8 @@ if (_google_configured and auth_code and returned_state
                 if DEBUG_MODE:
                     st.write(str(e))
             else:
-                st.session_state["fitbit"]["google_connected"] = True
+                if "fitbit" in st.session_state:
+                    st.session_state["fitbit"]["google_connected"] = True
                 st.success("Google Health connected — your data will keep "
                            "flowing after Fitbit's API shuts down.")
     # Drop ?code=/?state= so a rerun doesn't try to re-exchange the
@@ -889,11 +905,13 @@ if _google_configured and st.session_state.get("fitbit", {}).get("enrolled"):
             "above.</div>",
             unsafe_allow_html=True,
         )
-        # Random nonce after the marker — only the GOOGLE_STATE_PREFIX
-        # itself is actually checked on return; the nonce just avoids ever
-        # sending an identical state value twice.
-        gstate = GOOGLE_STATE_PREFIX + base64.urlsafe_b64encode(
-            os.urandom(16)).decode("utf-8").rstrip("=")
+        # Embed fitbit_id in the state so the callback can recover the
+        # participant identity even if Streamlit's session_state is wiped
+        # during the Google redirect (common on Streamlit Cloud). Format:
+        # "ghoauth:<fitbit_id>:<nonce>" — the nonce prevents identical
+        # state values on repeated clicks.
+        _g_nonce = base64.urlsafe_b64encode(os.urandom(16)).decode("utf-8").rstrip("=")
+        gstate = f"{GOOGLE_STATE_PREFIX}{st.session_state['fitbit']['encoded_id']}:{_g_nonce}"
         google_auth_url = (
             "https://accounts.google.com/o/oauth2/v2/auth?response_type=code"
             f"&client_id={GOOGLE_CLIENT_ID}"
@@ -913,4 +931,3 @@ if _google_configured and st.session_state.get("fitbit", {}).get("enrolled"):
                    display:inline-block;">Connect with Google</a></div>""",
             unsafe_allow_html=True,
         )
-
