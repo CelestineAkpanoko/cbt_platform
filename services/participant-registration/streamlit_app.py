@@ -16,6 +16,14 @@ Flow (OAuth must come first: the OAuth redirect reloads the page with
      no way to attribute a participant to the wrong Fitbit. The token file
      tokens/{fitbit_id}.json is stamped with the participant_id after
      enrollment.
+  4. Once enrolled, an optional "Connect with Google" step (added for the
+     Fitbit API sunset migration — see the Google Health API block below).
+     This never creates or matches a participant on its own: Google OAuth
+     only proves a Google account, not which study participant it belongs
+     to, so it's offered only after Fitbit OAuth has already proven the
+     fitbit_id this step attaches to. It writes a second, parallel token
+     file under google_health_tokens/{fitbit_id}.json — the existing
+     tokens/{fitbit_id}.json (Fitbit's own tokens) is never touched.
 
 Identity: the fitbit_id from the OAuth step is a PROVEN identifier (only
 the account holder can complete the flow), while user_id and email are
@@ -158,6 +166,47 @@ SCOPES = (
     "respiratory_rate temperature oxygen_saturation cardio_fitness "
     "electrocardiogram irregular_rhythm_notifications"
 )
+
+# --- Google Health API config (added for the Fitbit API sunset migration) --
+# Reuses REDIRECT_URI above — this app's single root URL already handles
+# the Fitbit callback, and Google's callback lands on the exact same URL.
+# The two are told apart by the `state` prefix (GOOGLE_STATE_PREFIX,
+# checked where query params are first read, below), never by the query
+# param names, since both providers send back `code` and `state`.
+#
+# Register this SAME REDIRECT_URI on the Google OAuth client too (Google
+# Cloud Console -> APIs & Services -> Credentials -> your client ->
+# Authorized redirect URIs), alongside the OAuth Playground URI you may
+# have added while testing — Console allows more than one.
+#
+# conf() only reads flat top-level secrets keys (see above), so add these
+# as plain top-level entries in secrets.toml, NOT inside a [section]:
+#   GOOGLE_CLIENT_ID = "....apps.googleusercontent.com"
+#   GOOGLE_CLIENT_SECRET = "..."
+GOOGLE_CLIENT_ID = conf("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = conf("GOOGLE_CLIENT_SECRET")
+GOOGLE_SCOPES = (
+    "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
+    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly"
+)
+# Parallel to S3_TOKEN_PREFIX below, same bucket — never written into
+# fitbit_tokens/, and keyed by the SAME fitbit_id (the Fitbit account's own
+# encoded id from the OAuth step), not a separate Google identity. This is
+# what lets the Phase 8 puller keep reading everything under one stable key
+# per participant regardless of which API actually served the data.
+GOOGLE_TOKEN_PREFIX = "google_health_tokens/"
+# Marks a `state` value as belonging to the Google flow. Chosen so it can
+# never collide with a real Fitbit PKCE code_verifier (generate_code_verifier()
+# below never produces a ":" character).
+GOOGLE_STATE_PREFIX = "ghoauth:"
+
+# Not a hard stop like the Fitbit config check above — Google reconnection
+# is additive, so an unconfigured Google client just hides that section
+# rather than breaking enrollment, which must keep working regardless.
+_google_configured = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+if not _google_configured and DEBUG_MODE:
+    st.caption("Google Health reconnection hidden — GOOGLE_CLIENT_ID / "
+              "GOOGLE_CLIENT_SECRET not set in secrets.")
 
 # Preselect only — the org actually used for a registration is picked from
 # the Registry-backed dropdown in Step 3 (org_id is per-tenant scoping and
@@ -328,6 +377,97 @@ def _first(value):
 params = st.query_params
 auth_code = _first(params.get("code"))
 returned_state = _first(params.get("state"))
+
+# --- Google Health API callback (added for the Fitbit API sunset
+# migration) — handled first and unconditionally, before the Fitbit block
+# below, because it can arrive whether or not a Fitbit session is still
+# present, and must never be mistaken for a Fitbit authorization code:
+# both providers redirect back to the same REDIRECT_URI with the same
+# `code`/`state` param names, so the `state` prefix is what tells them
+# apart. ---
+if (_google_configured and auth_code and returned_state
+       and returned_state.startswith(GOOGLE_STATE_PREFIX)):
+    fitbit_ctx = st.session_state.get("fitbit")
+    if not fitbit_ctx or not fitbit_ctx.get("enrolled"):
+        # Session was lost (new tab, server restart, etc.) between clicking
+        # "Connect with Google" and Google's redirect back. Without an
+        # established fitbit_id there is nothing safe to attach these
+        # tokens to — fail loudly rather than guess.
+        st.error(
+            "Your session was lost before this Google connection could be "
+            "linked to your enrollment. Please reopen the enrollment link, "
+            "reconnect Fitbit and confirm your enrollment, then retry "
+            "connecting Google from Step 3."
+        )
+        st.stop()
+
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": auth_code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+    )
+    if resp.status_code != 200:
+        st.error("We couldn't finish connecting to Google. Please try again.")
+        if DEBUG_MODE:
+            st.write(resp.text)
+    else:
+        gtokens = resp.json()
+        if not gtokens.get("refresh_token"):
+            # Missing when Google silently reuses an existing grant instead
+            # of showing the consent screen — happens on a retry without a
+            # fresh approval. A token set with no refresh_token is useless
+            # to the Phase 8 puller (it dies in ~1 hour), so this is
+            # treated as a failure, not a partial success.
+            st.error(
+                "Google didn't return a long-lived connection (no refresh "
+                "token). This usually happens on a retry. Please revoke "
+                "access at [myaccount.google.com/permissions]"
+                "(https://myaccount.google.com/permissions) under "
+                "'Heat Stress Research Study', then connect again."
+            )
+        else:
+            google_payload = {
+                "access_token": gtokens["access_token"],
+                "refresh_token": gtokens["refresh_token"],
+                "token_type": gtokens.get("token_type", "Bearer"),
+                "expires_at": int(
+                    datetime.datetime.now(datetime.timezone.utc).timestamp()
+                    + gtokens.get("expires_in", 3600)
+                ),
+                # Linkage back to the already-proven identity — never
+                # derived from anything Google told us.
+                "fitbit_id": fitbit_ctx["encoded_id"],
+                "participant_id": fitbit_ctx.get("participant_id"),
+                "org_id": fitbit_ctx.get("org_id"),
+            }
+            try:
+                _s3.put_object(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=f"{GOOGLE_TOKEN_PREFIX}{fitbit_ctx['encoded_id']}.json",
+                    Body=json.dumps(google_payload),
+                    ContentType="application/json",
+                )
+            except Exception as e:
+                st.error("We couldn't save your Google connection. Please "
+                        "contact the team.")
+                if DEBUG_MODE:
+                    st.write(str(e))
+            else:
+                st.session_state["fitbit"]["google_connected"] = True
+                st.success("Google Health connected — your data will keep "
+                           "flowing after Fitbit's API shuts down.")
+    # Drop ?code=/?state= so a rerun doesn't try to re-exchange the
+    # already-consumed (single-use) Google authorization code — same
+    # reasoning as the Fitbit "Connect a different device" handler below.
+    st.query_params.clear()
+    # Deliberately NOT st.stop() here on the success path: execution falls
+    # through to the existing Fitbit session_state (already present) and
+    # renders Step 3 normally below, now showing the Google-connected state.
 
 if "fitbit" not in st.session_state:
     if not auth_code:
@@ -685,6 +825,14 @@ if submitted:
             if DEBUG_MODE:
                 st.write("linkage write failed:", str(e))
 
+        # Record enrollment + identity onto the session so the Google
+        # reconnection section below (and a future rerun, e.g. after
+        # returning from Google's consent screen) knows this fitbit_id is
+        # now a confirmed participant, not just a connected Fitbit account.
+        st.session_state["fitbit"]["enrolled"] = True
+        st.session_state["fitbit"]["participant_id"] = result.participant_id
+        st.session_state["fitbit"]["org_id"] = org_id_input
+
         if effective_from != now_iso:
             st.info(
                 f"Enrollment date recorded as **{effective_from[:10]}** — "
@@ -710,3 +858,59 @@ if submitted:
             "You can close this page. To enroll another participant, reopen "
             "the link fresh (each participant connects their own Fitbit)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Google Health API reconnection (added for the Fitbit API sunset
+# migration) — offered only once enrollment above is confirmed, and shown
+# on EVERY rerun from then on (not just the run where the form was
+# submitted), since clicking the button navigates away to Google and the
+# next run starts fresh with `submitted=False`. See the callback handling
+# near the top of this file for the other half of this flow.
+# ---------------------------------------------------------------------------
+if _google_configured and st.session_state.get("fitbit", {}).get("enrolled"):
+    st.markdown("<div class='subheader'>Step 3 — Reconnect via Google Health</div>",
+               unsafe_allow_html=True)
+
+    if st.session_state["fitbit"].get("google_connected"):
+        st.markdown(
+            """<div style="text-align:center;"><div style="background-color:#e8f8ee;
+               padding:14px 20px; border-radius:12px; display:inline-block;
+               font-size:20px; color:#1b7a4e; font-weight:500;">
+               ✔️ Google Health connected</div></div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='normal-text'>Fitbit's developer API is being "
+            "retired. Connecting your Google account keeps your data "
+            "flowing afterward — this adds a second, longer-lasting "
+            "connection, it does not replace your Fitbit connection "
+            "above.</div>",
+            unsafe_allow_html=True,
+        )
+        # Random nonce after the marker — only the GOOGLE_STATE_PREFIX
+        # itself is actually checked on return; the nonce just avoids ever
+        # sending an identical state value twice.
+        gstate = GOOGLE_STATE_PREFIX + base64.urlsafe_b64encode(
+            os.urandom(16)).decode("utf-8").rstrip("=")
+        google_auth_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth?response_type=code"
+            f"&client_id={GOOGLE_CLIENT_ID}"
+            f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+            f"&scope={urllib.parse.quote(GOOGLE_SCOPES)}"
+            # offline + consent: without both, a returning participant can
+            # silently get no refresh_token back (see the callback handler's
+            # check above) and the puller dies in about an hour unnoticed.
+            "&access_type=offline&prompt=consent"
+            f"&state={urllib.parse.quote(gstate)}"
+        )
+        st.markdown(
+            f"""<div style="text-align:center; margin-top:15px;">
+                <a href="{google_auth_url}" style="background-color:#4285F4;
+                   color:white; padding:15px 30px; border-radius:10px;
+                   font-size:24px; font-weight:bold; text-decoration:none;
+                   display:inline-block;">Connect with Google</a></div>""",
+            unsafe_allow_html=True,
+        )
+
