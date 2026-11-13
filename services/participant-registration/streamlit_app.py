@@ -25,6 +25,17 @@ Flow (OAuth must come first: the OAuth redirect reloads the page with
      file under google_health_tokens/{fitbit_id}.json — the existing
      tokens/{fitbit_id}.json (Fitbit's own tokens) is never touched.
 
+GOOGLE-ONLY MODE (AUTH_PROVIDER = "google" in secrets): the legacy Fitbit Web
+API and its OAuth endpoints were decommissioned on 2026-10-30, so step 1 cannot
+use Fitbit any more. In this mode step 1 is "Connect with Google" instead, the
+Fitbit callback and token write are skipped entirely, and the Google token is
+written to google_health_tokens/<label>.json (where google-health-pull reads
+it) only AFTER enrollment succeeds. Google returns no Fitbit-style id, so the
+study team types a device LABEL in the form (pre-filled when Google reports the
+account's old Fitbit id). The label is a typed, NOT proven, identifier:
+register() still refuses a label that already belongs to a different
+participant (FitbitAccountInUseError). Default is "fitbit" (unchanged flow).
+
 Identity: the fitbit_id from the OAuth step is a PROVEN identifier (only
 the account holder can complete the flow), while user_id and email are
 typed and therefore merely claimed. register() enforces that a claimed
@@ -82,6 +93,7 @@ import streamlit as st
 # Catching it turns a traceback nobody can act on into an instruction.
 try:
     from cbt_shared.tenancy import ScopedTable
+    from registration_service import google_oauth as gauth
     from registration_service import (
         DuplicateSubmissionError,
         FitbitAccountInUseError,
@@ -138,6 +150,12 @@ def conf(key, default=None):
 # do not leave this on in a production deployment (echoes response bodies).
 DEBUG_MODE = str(conf("DEBUG_MODE", "false")).strip().lower() in ("1", "true", "yes")
 
+AUTH_PROVIDER = str(conf("AUTH_PROVIDER", "fitbit")).strip().lower()
+if AUTH_PROVIDER not in ("fitbit", "google"):
+    st.error("AUTH_PROVIDER must be 'fitbit' or 'google'.")
+    st.stop()
+IS_GOOGLE_ONLY = AUTH_PROVIDER == "google"
+
 CLIENT_ID = conf("FITBIT_CLIENT_ID")
 # MUST equal this app's own public URL and match the Fitbit dev-console
 # "Redirect URL" exactly. No default — a stale/wrong default here is
@@ -145,10 +163,10 @@ CLIENT_ID = conf("FITBIT_CLIENT_ID")
 # it isn't set, fail loudly below rather than guess.
 REDIRECT_URI = conf("REDIRECT_URI")
 
-_missing = [k for k, v in {
-    "FITBIT_CLIENT_ID": CLIENT_ID,
-    "REDIRECT_URI": REDIRECT_URI,
-}.items() if not v]
+_required_cfg = {"REDIRECT_URI": REDIRECT_URI}
+if not IS_GOOGLE_ONLY:
+    _required_cfg["FITBIT_CLIENT_ID"] = CLIENT_ID
+_missing = [k for k, v in _required_cfg.items() if not v]
 if _missing:
     st.error(
         "This app is missing required configuration: "
@@ -204,6 +222,10 @@ GOOGLE_STATE_PREFIX = "ghoauth:"
 # is additive, so an unconfigured Google client just hides that section
 # rather than breaking enrollment, which must keep working regardless.
 _google_configured = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+if IS_GOOGLE_ONLY and not _google_configured:
+    st.error("AUTH_PROVIDER is 'google' but GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET "
+             "are not set in Settings -> Secrets.")
+    st.stop()
 if not _google_configured and DEBUG_MODE:
     st.caption("Google Health reconnection hidden — GOOGLE_CLIENT_ID / "
               "GOOGLE_CLIENT_SECRET not set in secrets.")
@@ -489,7 +511,86 @@ if (_google_configured and auth_code and returned_state
     if "fitbit" not in st.session_state:
         st.stop()
 
+# --- Google-only mode: step-1 callback. State is "gsignin:<pkce verifier>", which
+# can never collide with the post-enrollment "ghoauth:" state above. Nothing is
+# written to S3 here: the label is chosen in the form below, and a token file
+# without a successful enrollment would be an orphan. ---
+GOOGLE_SIGNIN_PREFIX = "gsignin:"
+if (IS_GOOGLE_ONLY and "fitbit" not in st.session_state and auth_code
+        and returned_state and returned_state.startswith(GOOGLE_SIGNIN_PREFIX)):
+    try:
+        _gresp = requests.post(
+            gauth.TOKEN_ENDPOINT,
+            data=gauth.token_request_body(
+                GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, auth_code,
+                returned_state[len(GOOGLE_SIGNIN_PREFIX):], REDIRECT_URI),
+            timeout=30,
+        )
+        if _gresp.status_code != 200:
+            if DEBUG_MODE:
+                st.write(_gresp.text)
+            raise gauth.GoogleConnectError(
+                "We couldn't finish connecting to Google. Please try again.")
+        _g_payload = gauth.token_payload_from_response(
+            _gresp.json(),
+            datetime.datetime.now(datetime.timezone.utc).timestamp(),
+            (gauth.HEART_RATE_SCOPE,),
+        )
+    except gauth.GoogleConnectError as _e:
+        st.error(str(_e))
+        st.query_params.clear()
+        st.stop()
+    # Best effort: migrated Fitbit accounts report their old 6-character id.
+    _g_legacy = None
+    try:
+        _ident = requests.get(
+            gauth.IDENTITY_ENDPOINT, timeout=20,
+            headers={"Authorization": f"Bearer {_g_payload['access_token']}"})
+        if _ident.status_code == 200:
+            _g_legacy = gauth.legacy_id_from_identity(_ident.json())
+        elif DEBUG_MODE:
+            st.write("identity lookup:", _ident.status_code, _ident.text[:300])
+    except Exception as _e:  # noqa: BLE001
+        if DEBUG_MODE:
+            st.write("identity lookup failed:", str(_e))
+    st.session_state["fitbit"] = {
+        "encoded_id": _g_legacy or "",
+        "token_payload": _g_payload,
+        "provider": "google",
+    }
+    st.query_params.clear()  # the single-use ?code= must not linger
+    st.rerun()
+
 if "fitbit" not in st.session_state:
+    if IS_GOOGLE_ONLY:
+        # --- Google-only landing page: Connect with Google, then stop. ---
+        st.markdown(
+            "<h1 class='title-beige'>Welcome to the Heat Stress Research Study!</h1>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='subheader'>Step 1 — Connect your Google account</div>",
+                    unsafe_allow_html=True)
+        st.markdown(
+            "<div class='normal-text'>Securely connect the Google account your "
+            "Fitbit is linked to. After you log in and approve, we'll continue "
+            "to enrollment.<br><b>Leave every permission box ticked</b> on the "
+            "Google screen &mdash; the heart-rate permission is required.</div>",
+            unsafe_allow_html=True,
+        )
+        _gv = generate_code_verifier()
+        _gurl = gauth.build_auth_url(
+            GOOGLE_CLIENT_ID, REDIRECT_URI, tuple(GOOGLE_SCOPES.split()),
+            generate_code_challenge(_gv), GOOGLE_SIGNIN_PREFIX + _gv)
+        st.markdown(
+            f"""<div style="text-align:center; margin-top:25px;">
+                <a href="{_gurl}" style="background-color:#4285F4; color:white;
+                   padding:15px 30px; border-radius:10px; font-size:24px;
+                   font-weight:bold; text-decoration:none; display:inline-block;">
+                   Connect with Google</a></div>""",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
     if not auth_code:
         # --- Landing page: show the Connect button, then stop. ---
         st.markdown(
@@ -640,12 +741,12 @@ st.markdown(
     f"""<div style="text-align:center;"><div style="background-color:#e8f8ee;
        padding:14px 20px; border-radius:12px; display:inline-block; font-size:20px;
        color:#1b7a4e; font-weight:500; margin-bottom:10px;">
-       ✔️ Fitbit account connected (ID: {encoded_id})</div></div>""",
+       ✔️ {"Google account connected" if IS_GOOGLE_ONLY else "Fitbit account connected"}{(" (ID: " + encoded_id + ")") if encoded_id else ""}</div></div>""",
     unsafe_allow_html=True,
 )
 _reconnect_col = st.columns([3, 1])[1]
 with _reconnect_col:
-    if st.button("🔄 Connect a different Fitbit device", use_container_width=True):
+    if st.button("🔄 Connect a different account" if IS_GOOGLE_ONLY else "🔄 Connect a different Fitbit device", use_container_width=True):
         # Reset to Step 1. Also clear ?code=/?state= from the URL — Fitbit
         # authorization codes are single-use, so leaving the old ones in
         # place would make the rerun immediately try (and fail) to
@@ -703,10 +804,25 @@ fitbit_id = encoded_id
 cosinuss_pool = unassigned_devices(devices, "cosinuss", cosinuss_id_options())
 
 with st.form("enroll"):
-    st.text_input("Fitbit ID (from the connected account)", value=fitbit_id,
-                  disabled=True,
-                  help="Captured automatically during the Fitbit connection "
-                       "step — this is the ID your raw data is stored under.")
+    if IS_GOOGLE_ONLY:
+        label_input = st.text_input(
+            "Device label (Fitbit ID)", value=fitbit_id,
+            help="Choose a 4-12 character label (letters/digits, e.g. CR8Y24). "
+                 "Google does not supply one, so it is set here. It becomes the "
+                 "folder name the heart-rate data is stored under and the "
+                 "participant's fitbit_id in the ledger. Pre-filled when Google "
+                 "reports the account's old Fitbit id. Reusing a label replaces "
+                 "that label's previous connection.")
+        replace_ok = st.checkbox(
+            "If this label already has a connection, replace it",
+            help="Only tick this when re-connecting the same participant or "
+                 "device. The previous Google authorization for the label stops "
+                 "being used.")
+    else:
+        st.text_input("Fitbit ID (from the connected account)", value=fitbit_id,
+                      disabled=True,
+                      help="Captured automatically during the Fitbit connection "
+                           "step — this is the ID your raw data is stored under.")
     user_id = st.text_input("User ID (format: user15)")
     email = st.text_input("Email")
     display_name = st.text_input("Display name / anonymized ID")
@@ -774,6 +890,26 @@ if submitted:
         st.stop()
     cosinuss_id = _resolve_pick(cosinuss_pick, cosinuss_other) or None
 
+    if IS_GOOGLE_ONLY:
+        try:
+            fitbit_id = gauth.normalize_label(label_input)
+        except gauth.GoogleConnectError as _e:
+            st.error(str(_e))
+            st.stop()
+        _g_token_key = f"{GOOGLE_TOKEN_PREFIX}{fitbit_id}.json"
+        try:
+            _s3.head_object(Bucket=S3_BUCKET_NAME, Key=_g_token_key)
+            _label_has_token = True
+        except Exception:  # noqa: BLE001 - 404 means the label is free
+            _label_has_token = False
+        if _label_has_token and not replace_ok:
+            st.error(
+                f"The label {fitbit_id} already has a connection. Pick a different "
+                "label, or tick 'replace it' if you are re-connecting the same "
+                "participant. No registration was created."
+            )
+            st.stop()
+
     # BACKDATE enrollment to when this Fitbit account actually joined the
     # study, not the moment this form was submitted. After the ledger wipe,
     # everyone re-registers — but their raw data (append-only, survived the
@@ -812,6 +948,10 @@ if submitted:
         # Fitbit session rather than anyone acting in bad faith — so lead
         # with the fix, not an accusation. Nothing was written.
         st.error(f"**We did not save this registration.** {e}")
+        if IS_GOOGLE_ONLY:
+            st.info("That device label already belongs to a different participant. "
+                    "Choose a different label for this person.", icon="🔑")
+            st.stop()
         st.info(
             "**How to connect the right account:** log out at "
             "[fitbit.com](https://www.fitbit.com/logout) *or* reopen this "
@@ -833,7 +973,31 @@ if submitted:
         # (org_id wasn't known yet); this replaces it with what was
         # actually typed into the form.
         # Best-effort: never fail an otherwise-successful enrollment on it.
-        try:
+        if IS_GOOGLE_ONLY:
+            # NOT best-effort (unlike the Fitbit linkage write below): without
+            # this token file the pull Lambda has nothing to read, so heart-rate
+            # data silently never arrives. Say so loudly.
+            try:
+                _s3.put_object(
+                    Bucket=S3_BUCKET_NAME, Key=_g_token_key,
+                    Body=json.dumps(gauth.stamped_payload(
+                        fitbit["token_payload"], fitbit_id,
+                        result.participant_id, org_id_input)),
+                    ContentType="application/json",
+                )
+                st.session_state["fitbit"]["google_connected"] = True
+            except Exception as e:  # noqa: BLE001
+                st.error(
+                    "Enrollment was saved, but the Google connection could NOT be "
+                    f"stored for label {fitbit_id}. Data will not flow until the "
+                    "participant connects again. Please contact the research team."
+                )
+                if DEBUG_MODE:
+                    st.write("token write failed:", str(e))
+                st.stop()
+            st.session_state["fitbit"]["encoded_id"] = fitbit_id
+        else:
+          try:
             stamped = {**fitbit["token_payload"],
                        "participant_id": result.participant_id,
                        "org_id": org_id_input}
@@ -841,7 +1005,7 @@ if submitted:
                 Bucket=S3_BUCKET_NAME, Key=f"{S3_TOKEN_PREFIX}{encoded_id}.json",
                 Body=json.dumps(stamped), ContentType="application/json",
             )
-        except Exception as e:
+          except Exception as e:
             if DEBUG_MODE:
                 st.write("linkage write failed:", str(e))
 
