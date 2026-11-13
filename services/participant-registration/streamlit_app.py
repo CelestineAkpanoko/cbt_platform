@@ -98,6 +98,7 @@ try:
         DuplicateSubmissionError,
         FitbitAccountInUseError,
         RegistrationRequest,
+        find_participant,
         ValidationError,
         list_clarity_station_ids,
         list_cosinuss_receivers,
@@ -872,6 +873,31 @@ def _resolve_pick(pick, other):
         return pick
     return ""
 
+def _save_google_token(participant_id):
+    """Google-only mode: write google_health_tokens/<label>.json, stamped with the
+    participant. NOT best-effort - without it the pull Lambda has nothing to read.
+    Returns True on success; on failure shows a loud error and returns False."""
+    try:
+        _s3.put_object(
+            Bucket=S3_BUCKET_NAME, Key=_g_token_key,
+            Body=json.dumps(gauth.stamped_payload(
+                fitbit["token_payload"], fitbit_id, participant_id, org_id_input)),
+            ContentType="application/json",
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(
+            "Enrollment was saved, but the Google connection could NOT be "
+            f"stored for label {fitbit_id}. Data will not flow until the "
+            "participant connects again. Please contact the research team."
+        )
+        if DEBUG_MODE:
+            st.write("token write failed:", str(e))
+        return False
+    st.session_state["fitbit"]["google_connected"] = True
+    st.session_state["fitbit"]["encoded_id"] = fitbit_id
+    return True
+
+
 if submitted:
     site_id = _resolve_pick(site_pick, site_other).strip()
     if not site_id:
@@ -964,7 +990,28 @@ if submitted:
     except ValidationError as e:
         st.error(str(e))
     except DuplicateSubmissionError:
-        st.warning("This registration was already submitted — no duplicate created.")
+        _saved = False
+        if IS_GOOGLE_ONLY:
+            # Already enrolled with these identifiers (typical when re-connecting an
+            # existing participant). Save the Google connection anyway, but only
+            # when the existing record really owns this label and user id, so a
+            # typed label can never attach a token to someone else's record.
+            try:
+                _ex, _matched = find_participant(
+                    participants, req.user_id, req.email, fitbit_id)
+            except Exception:  # noqa: BLE001
+                _ex = None
+            if (_ex and _ex.get("fitbit_id") == fitbit_id
+                    and _ex.get("user_id") == req.user_id):
+                if _save_google_token(_ex["participant_id"]):
+                    _saved = True
+                    st.success(
+                        f"{req.user_id} was already enrolled. Their Google "
+                        f"connection is now saved for label {fitbit_id}.")
+                else:
+                    st.stop()
+        if not _saved:
+            st.warning("This registration was already submitted — no duplicate created.")
     else:
         # Stamp the participant_id + real org_id into the token file so
         # tokens/{fitbit_id}.json is traceable to the enrolled person —
@@ -974,28 +1021,8 @@ if submitted:
         # actually typed into the form.
         # Best-effort: never fail an otherwise-successful enrollment on it.
         if IS_GOOGLE_ONLY:
-            # NOT best-effort (unlike the Fitbit linkage write below): without
-            # this token file the pull Lambda has nothing to read, so heart-rate
-            # data silently never arrives. Say so loudly.
-            try:
-                _s3.put_object(
-                    Bucket=S3_BUCKET_NAME, Key=_g_token_key,
-                    Body=json.dumps(gauth.stamped_payload(
-                        fitbit["token_payload"], fitbit_id,
-                        result.participant_id, org_id_input)),
-                    ContentType="application/json",
-                )
-                st.session_state["fitbit"]["google_connected"] = True
-            except Exception as e:  # noqa: BLE001
-                st.error(
-                    "Enrollment was saved, but the Google connection could NOT be "
-                    f"stored for label {fitbit_id}. Data will not flow until the "
-                    "participant connects again. Please contact the research team."
-                )
-                if DEBUG_MODE:
-                    st.write("token write failed:", str(e))
+            if not _save_google_token(result.participant_id):
                 st.stop()
-            st.session_state["fitbit"]["encoded_id"] = fitbit_id
         else:
           try:
             stamped = {**fitbit["token_payload"],
